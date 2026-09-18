@@ -1,4 +1,4 @@
-import { LitElement, html, css } from "lit";
+import { LitElement, html, css, type PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { repeat } from "lit/directives/repeat.js";
 import { load, type Loaded } from "./pcm";
@@ -262,6 +262,10 @@ export class App extends LitElement {
   play(list: Track[], i: number) {
     this.nowId = list[i].id;
     (this.renderRoot.querySelector("mlm-player") as Player).play(list, i);
+  }
+
+  updated(changed: PropertyValues) {   // keep the current row on screen (j/k, auto-advance); "nearest" is a no-op when already visible
+    if (changed.has("nowId")) this.renderRoot.querySelector(".row.on")?.scrollIntoView({ block: "nearest" });
   }
 
   render() {
