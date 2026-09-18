@@ -54,6 +54,7 @@ async fn main() {
         .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("../static/app.js").as_slice()) }))
         .route("/api/tracks", get(tracks))
         .route("/api/tracks/{id}/stream", get(stream))
+        .route("/api/tracks/{id}/file", get(file))
         .route("/api/tags", get(tags_get).put(tags_put))
         .route("/api/rescan", post(|State(app): State<App>| async move { app.rescan(); StatusCode::ACCEPTED }))
         .with_state(app);
@@ -106,6 +107,14 @@ async fn stream(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Re
     match stream_aiff(&t.path, req.headers()).await {
         Ok(r) => r,
         Err(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()).into_response(),
+    }
+}
+
+/// The original file, untouched (Shift+D in the player); the browser names it via the anchor's `download`.
+async fn file(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Response {
+    match app.tracks().iter().find(|t| t.id == id) {
+        Some(t) => ServeFile::new(&t.path).oneshot(req).await.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

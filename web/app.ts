@@ -62,13 +62,13 @@ export class Player extends LitElement {
     window.removeEventListener("keydown", this.key);
   }
 
-  // vim-style: space = play/pause, j/k = next/prev track, h/l = -/+ 1 min, ? = help. Ignored while typing in an input.
+  // vim-style: space = play/pause, j/k = next/prev track, h/l = -/+ 1 min, D = download, ? = help. Ignored while typing in an input.
   private key = (e: KeyboardEvent) => {
     if (typing(e)) return;
     const help = this.renderRoot.querySelector("dialog")!;
     const act: Record<string, () => void> = {
       " ": () => this.toggle(), j: () => this.next(), k: () => this.prev(),
-      h: () => this.skip(-60), l: () => this.skip(60),
+      h: () => this.skip(-60), l: () => this.skip(60), D: () => this.download(),
       "?": () => help.open ? help.close() : help.showModal(),
     };
     if (act[e.key]) { e.preventDefault(); act[e.key](); }
@@ -86,6 +86,10 @@ export class Player extends LitElement {
   seek(sec: number) { if (this.cur) this.start(this.i, sec); }   // ponytail: no range re-fetch on seek; whole AIFF lands in ~2 s on LAN
   toggle() { const c = this.ctx; if (c) c.state === "running" ? c.suspend() : c.resume(); }
   skip(s: number) { if (this.cur) this.seek(Math.min(Math.max(this.pos + s, 0), this.dur)); }
+  download() {
+    const t = this.track;
+    if (t) Object.assign(document.createElement("a"), { href: `/api/tracks/${t.id}/file`, download: t.rel.split("/").pop() }).click();
+  }
 
   private open(t: Track): Slot {
     const abort = new AbortController();
@@ -180,7 +184,7 @@ export class Player extends LitElement {
                   @seek=${(e: CustomEvent<number>) => this.seek(e.detail * this.dur)}></mlm-wave>
       </div>
       <div>${fmt(this.t)} / ${fmt(this.dur)}</div>
-      <dialog><b>Keys</b><br>space — play / pause<br>j / k — next / previous track<br>h / l — back / forward 1 min<br>tag keys — toggle that tag on the playing track (see tags panel)<br>? — this help<br><small>Esc closes</small></dialog>`;
+      <dialog><b>Keys</b><br>space — play / pause<br>j / k — next / previous track<br>h / l — back / forward 1 min<br>shift+d — download the playing track<br>tag keys — toggle that tag on the playing track (see tags panel)<br>? — this help<br><small>Esc closes</small></dialog>`;
   }
 }
 

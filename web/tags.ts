@@ -1,7 +1,7 @@
 /** User tags: name -> shortcut key, and track (relative path) -> tag names. Pure; the app PUTs the whole doc. */
 export type Tags = { keys: Record<string, string>; tracks: Record<string, string[]> };
 
-export const RESERVED = " jkhl?";   // keys already taken by <mlm-player>
+export const RESERVED = " jkhl?D";   // keys already taken by <mlm-player>
 export const empty: Tags = { keys: {}, tracks: {} };
 
 export const has = (t: Tags, rel: string, name: string) => (t.tracks[rel] ?? []).includes(name);
