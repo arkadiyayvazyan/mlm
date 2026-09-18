@@ -15,14 +15,15 @@ type Slot = { id: number; l: Loaded; abort: AbortController; scheduled: number }
 
 const LOOKAHEAD = 3;                     // seconds of audio kept scheduled ahead of the clock
 const CHUNK = 1;                         // seconds per AudioBufferSourceNode
+const PRELOAD = 5;                       // tracks fetched ahead of the current one
 const dur = (l: Loaded) => l.frames && l.rate ? l.frames / l.rate : 0;   // 0 = header not in yet
 
 /**
- * Gapless player: decoded PCM (`cur` playing, `nxt` preloaded) is cut into 1 s AudioBuffers and
- * started on the AudioContext clock. `t0` is the ctx time of `cur` frame 0; `nxt` starts exactly
- * at `t0 + cur.frames / cur.rate`, so the transition is sample-accurate.
+ * Gapless player: decoded PCM (`cur` playing, the next PRELOAD tracks loading in `ahead`) is cut
+ * into 1 s AudioBuffers and started on the AudioContext clock. `t0` is the ctx time of `cur` frame 0;
+ * `ahead[0]` starts exactly at `t0 + cur.frames / cur.rate`, so the transition is sample-accurate.
  */
-// ponytail: Float32 in memory ≈ 10 MB/min stereo; cur+nxt of 10-min tracks ≈ 200 MB. Keep Int16 and convert on schedule if a phone chokes
+// ponytail: Float32 in memory ≈ 10 MB/min stereo; cur + PRELOAD tracks of 6 min ≈ 360 MB. Keep Int16 and convert on schedule if a phone chokes
 @customElement("mlm-player")
 export class Player extends LitElement {
   static styles = css`
@@ -41,7 +42,7 @@ export class Player extends LitElement {
 
   private ctx?: AudioContext;
   private cur?: Slot;
-  private nxt?: Slot;
+  private ahead: Slot[] = [];   // queue[i+1 .. i+PRELOAD], ahead[0] is scheduled right after cur
   private t0 = 0;
   private nodes: AudioBufferSourceNode[] = [];
   private timer = 0;
@@ -91,7 +92,7 @@ export class Player extends LitElement {
     return s;
   }
 
-  /** Rebuild the timeline so queue[i] plays from `offset` seconds. Reuses cur (seek/restart) and nxt (next). */
+  /** Rebuild the timeline so queue[i] plays from `offset` seconds. Reuses any slot already in the window (seek, next, prev within PRELOAD). */
   private start(i: number, offset = 0) {
     const t = this.queue[i];
     if (!t) return;
@@ -101,33 +102,29 @@ export class Player extends LitElement {
     if (ctx.state === "suspended") ctx.resume();
     for (const n of this.nodes) { n.stop(); n.disconnect(); }
     this.nodes = [];
-    const following = this.queue[i + 1];
-    let cur = this.cur, nxt = this.nxt;
-    if (cur?.id !== t.id) {
-      cur?.abort.abort();   // ponytail: prev() refetches the track we just left
-      cur = nxt?.id === t.id ? nxt : this.open(t);
-      if (nxt === cur) nxt = undefined;
-      this.dispatchEvent(new CustomEvent("track-change", { detail: t.id }));
-    }
-    if (nxt && nxt.id !== following?.id) { nxt.abort.abort(); nxt = undefined; }
-    if (!nxt && following) nxt = this.open(following);
-    this.cur = cur; this.nxt = nxt; this.i = i;
+    // reuse any already-loading slot for the new window, abort the rest
+    const pool = new Map([this.cur, ...this.ahead].filter((s): s is Slot => !!s).map(s => [s.id, s]));
+    const take = (tr: Track) => { const s = pool.get(tr.id) ?? this.open(tr); pool.delete(tr.id); s.scheduled = 0; return s; };
+    if (this.cur?.id !== t.id) this.dispatchEvent(new CustomEvent("track-change", { detail: t.id }));
+    const cur = take(t);
+    this.ahead = this.queue.slice(i + 1, i + 1 + PRELOAD).map(take);
+    for (const s of pool.values()) s.abort.abort();   // ponytail: prev() refetches the track we just left
+    this.cur = cur; this.i = i;
     this.t0 = ctx.currentTime - offset;
     cur.scheduled = Math.min(Math.round(offset * cur.l.rate), cur.l.frames);
-    if (nxt) nxt.scheduled = 0;
     this.tick();
   }
 
-  /** Scheduler: promote nxt when cur has run out, then keep LOOKAHEAD seconds of both queued on the ctx clock. */
+  /** Scheduler: promote ahead[0] when cur has run out, then keep LOOKAHEAD seconds of both queued on the ctx clock. */
   private tick() {
     const ctx = this.ctx;
     if (!ctx || !this.cur) return;
     const now = ctx.currentTime;
     let end = this.t0 + dur(this.cur.l);
-    while (dur(this.cur.l) && now >= end && this.nxt) {   // loop: nxt may be shorter than one tick
-      this.cur = this.nxt; this.t0 = end; this.i++;
-      const n = this.queue[this.i + 1];
-      this.nxt = n ? this.open(n) : undefined;
+    while (dur(this.cur.l) && now >= end && this.ahead.length) {   // loop: next may be shorter than one tick
+      this.cur = this.ahead.shift()!; this.t0 = end; this.i++;
+      const n = this.queue[this.i + PRELOAD];
+      if (n) this.ahead.push(this.open(n));
       this.dispatchEvent(new CustomEvent("track-change", { detail: this.cur.id }));
       end = this.t0 + dur(this.cur.l);
     }
@@ -138,11 +135,11 @@ export class Player extends LitElement {
       end = this.t0 + dur(c.l);
     }
     this.schedule(c, this.t0);
-    if (this.nxt && dur(c.l)) this.schedule(this.nxt, end);
+    if (this.ahead[0] && dur(c.l)) this.schedule(this.ahead[0], end);
     this.dur = dur(c.l);
     this.t = this.pos;
     this.loaded = c.l.frames ? c.l.loaded / c.l.frames : 0;
-    const ended = !this.nxt && this.dur > 0 && now >= end;
+    const ended = !this.ahead.length && this.dur > 0 && now >= end;
     this.playing = ctx.state === "running" && !ended;
     if (this.playing && !this.raf) this.raf = requestAnimationFrame(this.frame);
   }
