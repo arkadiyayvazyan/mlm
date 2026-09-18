@@ -21,6 +21,7 @@ pub struct Track {
     pub track_no: u32,
     pub duration_ms: u64,
     pub rate: u32,
+    pub bpm: u32,
     pub ext: String,
     /// Path relative to the music root: the stable key for tags (`id` changes across Rust releases).
     pub rel: String,
@@ -46,6 +47,9 @@ struct CachedTrack {
     duration_ms: u64,
     #[serde(default)]
     rate: u32,
+    /// None = cache entry predates this field (re-tag once); Some(0) = untagged.
+    #[serde(default)]
+    bpm: Option<u32>,
 }
 
 fn id_of(path: &Path) -> u64 {
@@ -77,6 +81,7 @@ fn read_tags(path: &Path) -> Option<CachedTrack> {
         track_no: tag.and_then(|t| t.track()).unwrap_or(0),
         duration_ms: dur,
         rate,
+        bpm: Some(get(ItemKey::IntegerBpm).or_else(|| get(ItemKey::Bpm)).and_then(|s| s.trim().parse::<f64>().ok()).map(|b| b.round() as u32).unwrap_or(0)),
     })
 }
 
@@ -100,7 +105,7 @@ pub fn scan(dir: &Path, cache_path: &Path) -> Vec<Track> {
         }
         let mt = mtime(p);
         let t = match old.0.get(p) {
-            Some((m, t)) if *m == mt && t.rate != 0 => t.clone(), // rate==0: pre-rate cache entry, re-tag
+            Some((m, t)) if *m == mt && t.rate != 0 && t.bpm.is_some() => t.clone(), // rate==0 / bpm None: older cache entry, re-tag
             _ => match read_tags(p) {
                 Some(t) => { n += 1; t }
                 None => continue,
@@ -137,10 +142,45 @@ fn to_tracks(dir: &Path, c: Cache) -> Vec<Track> {
             track_no: t.track_no,
             duration_ms: t.duration_ms,
             rate: t.rate,
+            bpm: t.bpm.unwrap_or(0),
             rel: path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().into_owned(),
             path,
         })
         .collect();
     v.sort_by(|a, b| (&a.artist, &a.album, a.track_no, &a.title).cmp(&(&b.artist, &b.album, b.track_no, &b.title)));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lofty::config::WriteOptions;
+    use lofty::tag::{Tag, TagType};
+
+    #[test]
+    fn bpm_from_tag_and_cache_refresh() {
+        let dir = std::env::temp_dir().join(format!("mlm-bpm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("t.wav");
+        // minimal 44-byte PCM header + 100 silent 16-bit mono samples at 8 kHz
+        let mut b = Vec::new();
+        b.extend(b"RIFF"); b.extend(236u32.to_le_bytes()); b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes()); b.extend(1u16.to_le_bytes()); b.extend(1u16.to_le_bytes());
+        b.extend(8000u32.to_le_bytes()); b.extend(16000u32.to_le_bytes()); b.extend(2u16.to_le_bytes()); b.extend(16u16.to_le_bytes());
+        b.extend(b"data"); b.extend(200u32.to_le_bytes()); b.extend([0u8; 200]);
+        std::fs::write(&wav, b).unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(ItemKey::IntegerBpm, "128".into());
+        lofty::tag::TagExt::save_to_path(&tag, &wav, WriteOptions::default()).unwrap();
+
+        let cache = dir.join("idx.json");
+        // pre-bpm cache entry (no `bpm` field) must be re-tagged, not trusted
+        std::fs::write(&cache, format!(
+            r#"{{"{}":[{},{{"title":"stale","artist":"","album":"","track_no":0,"duration_ms":0,"rate":8000}}]}}"#,
+            wav.display(), mtime(&wav))).unwrap();
+        let t = &scan(&dir, &cache)[0];
+        assert_eq!((t.bpm, t.title.as_str()), (128, "t"));
+        assert_eq!(scan(&dir, &cache)[0].bpm, 128); // second scan served from refreshed cache
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

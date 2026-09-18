@@ -6,7 +6,7 @@ import { add, empty, has, remove, toggle, type Tags } from "./tags";
 
 type Track = {
   id: number; title: string; artist: string; album: string;
-  track_no: number; duration_ms: number; rate: number; ext: string; rel: string;
+  track_no: number; duration_ms: number; rate: number; bpm: number; ext: string; rel: string;
 };
 
 const url = (t: Track) => `/api/tracks/${t.id}/stream`;
@@ -249,11 +249,11 @@ export class App extends LitElement {
     kbd { opacity: .6; font-size: .85em; }
     .tag { margin-left: 6px; padding: 0 5px; border-radius: 6px; background: color-mix(in srgb, currentColor 15%, transparent); }
     .list { overflow-y: auto; }
-    .row { display: grid; grid-template-columns: 1fr 1fr 1fr 4em; gap: 8px; padding: 6px 16px; cursor: pointer;
+    .row { display: grid; grid-template-columns: 1fr 1fr 1fr 3em 4em; gap: 8px; padding: 6px 16px; cursor: pointer;
            content-visibility: auto; contain-intrinsic-size: auto 2.2em; }
     .row:hover, .row.on { background: color-mix(in srgb, currentColor 10%, transparent); }
     .row > * { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-    .row > :last-child { text-align: right; opacity: .6; }
+    .row > :nth-last-child(-n+2) { text-align: right; opacity: .6; }
   `;
   @state() tracks: Track[] = [];
   @state() q = "";
@@ -329,7 +329,7 @@ export class App extends LitElement {
         ${repeat(list, t => t.id, (t, i) => html`
           <div class="row ${t.id === this.nowId ? "on" : ""}" @click=${() => this.play(list, i)}>
             <span>${t.title}${(this.tags.tracks[t.rel] ?? []).map(n => html`<small class="tag">${n}</small>`)}</span><span>${t.artist}</span><span>${t.album}</span>
-            <span>${fmt(t.duration_ms / 1000)}</span>
+            <span>${t.bpm || ""}</span><span>${fmt(t.duration_ms / 1000)}</span>
           </div>`)}
       </div>
       <mlm-player @track-change=${(e: CustomEvent) => this.nowId = e.detail}></mlm-player>`;
