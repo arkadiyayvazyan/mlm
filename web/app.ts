@@ -58,12 +58,12 @@ export class Player extends LitElement {
     window.removeEventListener("keydown", this.key);
   }
 
-  // vim-style: j/k/space = play/pause, h/l = -/+ 1 min, ? = help. Ignored while typing in an input.
+  // vim-style: space = play/pause, j/k = next/prev track, h/l = -/+ 1 min, ? = help. Ignored while typing in an input.
   private key = (e: KeyboardEvent) => {
     if ((e.target as HTMLElement).tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
     const help = this.renderRoot.querySelector("dialog")!;
     const act: Record<string, () => void> = {
-      j: () => this.toggle(), k: () => this.toggle(), " ": () => this.toggle(),
+      " ": () => this.toggle(), j: () => this.next(), k: () => this.prev(),
       h: () => this.skip(-60), l: () => this.skip(60),
       "?": () => help.open ? help.close() : help.showModal(),
     };
@@ -186,7 +186,7 @@ export class Player extends LitElement {
                   @seek=${(e: CustomEvent<number>) => this.seek(e.detail * this.dur)}></mlm-wave>
       </div>
       <div>${fmt(this.t)} / ${fmt(this.dur)}</div>
-      <dialog><b>Keys</b><br>j / k / space — play / pause<br>h / l — back / forward 1 min<br>? — this help<br><small>Esc closes</small></dialog>`;
+      <dialog><b>Keys</b><br>space — play / pause<br>j / k — next / previous track<br>h / l — back / forward 1 min<br>? — this help<br><small>Esc closes</small></dialog>`;
   }
 }
 
