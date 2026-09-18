@@ -22,6 +22,8 @@ pub struct Track {
     pub duration_ms: u64,
     pub rate: u32,
     pub ext: String,
+    /// Path relative to the music root: the stable key for tags (`id` changes across Rust releases).
+    pub rel: String,
 }
 
 impl Track {
@@ -110,19 +112,19 @@ pub fn scan(dir: &Path, cache_path: &Path) -> Vec<Track> {
         let _ = std::fs::write(cache_path, b);
     }
     eprintln!("scan: {} tracks ({} newly tagged)", new.0.len(), n);
-    to_tracks(new)
+    to_tracks(dir, new)
 }
 
 /// Load the cache only (fast startup path); `scan` refreshes it afterwards.
-pub fn load_cache(cache_path: &Path) -> Vec<Track> {
+pub fn load_cache(dir: &Path, cache_path: &Path) -> Vec<Track> {
     std::fs::read(cache_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<Cache>(&b).ok())
-        .map(to_tracks)
+        .map(|c| to_tracks(dir, c))
         .unwrap_or_default()
 }
 
-fn to_tracks(c: Cache) -> Vec<Track> {
+fn to_tracks(dir: &Path, c: Cache) -> Vec<Track> {
     let mut v: Vec<Track> = c
         .0
         .into_iter()
@@ -135,6 +137,7 @@ fn to_tracks(c: Cache) -> Vec<Track> {
             track_no: t.track_no,
             duration_ms: t.duration_ms,
             rate: t.rate,
+            rel: path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().into_owned(),
             path,
         })
         .collect();

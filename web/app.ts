@@ -2,14 +2,18 @@ import { LitElement, html, css } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { repeat } from "lit/directives/repeat.js";
 import { load, type Loaded } from "./pcm";
+import { add, empty, has, remove, toggle, type Tags } from "./tags";
 
 type Track = {
   id: number; title: string; artist: string; album: string;
-  track_no: number; duration_ms: number; rate: number; ext: string;
+  track_no: number; duration_ms: number; rate: number; ext: string; rel: string;
 };
 
 const url = (t: Track) => `/api/tracks/${t.id}/stream`;
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+// window listeners see shadow-DOM events retargeted to the host, so composedPath()[0] is the real target
+const typing = (e: KeyboardEvent) =>
+  (e.composedPath()[0] as HTMLElement).tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey;
 
 type Slot = { id: number; l: Loaded; abort: AbortController; scheduled: number };
 
@@ -61,7 +65,7 @@ export class Player extends LitElement {
 
   // vim-style: space = play/pause, j/k = next/prev track, h/l = -/+ 1 min, ? = help. Ignored while typing in an input.
   private key = (e: KeyboardEvent) => {
-    if ((e.target as HTMLElement).tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (typing(e)) return;
     const help = this.renderRoot.querySelector("dialog")!;
     const act: Record<string, () => void> = {
       " ": () => this.toggle(), j: () => this.next(), k: () => this.prev(),
@@ -183,7 +187,7 @@ export class Player extends LitElement {
                   @seek=${(e: CustomEvent<number>) => this.seek(e.detail * this.dur)}></mlm-wave>
       </div>
       <div>${fmt(this.t)} / ${fmt(this.dur)}</div>
-      <dialog><b>Keys</b><br>space — play / pause<br>j / k — next / previous track<br>h / l — back / forward 1 min<br>? — this help<br><small>Esc closes</small></dialog>`;
+      <dialog><b>Keys</b><br>space — play / pause<br>j / k — next / previous track<br>h / l — back / forward 1 min<br>tag keys — toggle that tag on the playing track (see tags panel)<br>? — this help<br><small>Esc closes</small></dialog>`;
   }
 }
 
@@ -241,9 +245,16 @@ export class Wave extends LitElement {
 @customElement("mlm-app")
 export class App extends LitElement {
   static styles = css`
-    :host { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+    :host { display: grid; grid-template-rows: auto auto 1fr auto; height: 100vh; }
     input[type=search] { font: inherit; width: 100%; box-sizing: border-box; padding: 8px 12px; border: 0;
                          border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+    details { padding: 4px 12px; border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+    summary { cursor: pointer; opacity: .6; }
+    details > div { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 0; }
+    details button, details input { font: inherit; }
+    details .on { background: color-mix(in srgb, AccentColor 30%, transparent); }
+    kbd { opacity: .6; font-size: .85em; }
+    .tag { margin-left: 6px; padding: 0 5px; border-radius: 6px; background: color-mix(in srgb, currentColor 15%, transparent); }
     .list { overflow-y: auto; }
     .row { display: grid; grid-template-columns: 1fr 1fr 1fr 4em; gap: 8px; padding: 6px 16px; cursor: pointer; }
     .row:hover, .row.on { background: color-mix(in srgb, currentColor 10%, transparent); }
@@ -253,32 +264,73 @@ export class App extends LitElement {
   @state() tracks: Track[] = [];
   @state() q = "";
   @state() nowId = -1;
+  @state() tags: Tags = empty;
 
   async connectedCallback() {
     super.connectedCallback();
-    this.tracks = await (await fetch("/api/tracks")).json();
+    window.addEventListener("keydown", this.key);
+    [this.tracks, this.tags] = await Promise.all([fetch("/api/tracks"), fetch("/api/tags")].map(p => p.then(r => r.json())));
   }
+  disconnectedCallback() { super.disconnectedCallback(); window.removeEventListener("keydown", this.key); }
 
   get filtered() {
     const q = this.q.trim().toLowerCase();
     if (!q) return this.tracks;
-    return this.tracks.filter(t => `${t.title} ${t.artist} ${t.album}`.toLowerCase().includes(q));
+    return this.tracks.filter(t => `${t.title} ${t.artist} ${t.album} ${(this.tags.tracks[t.rel] ?? []).join(" ")}`.toLowerCase().includes(q));
   }
+  get now() { return this.tracks.find(t => t.id === this.nowId); }
 
   play(list: Track[], i: number) {
     this.nowId = list[i].id;
     (this.renderRoot.querySelector("mlm-player") as Player).play(list, i);
   }
 
+  // a tag's key toggles it on the playing track
+  private key = (e: KeyboardEvent) => {
+    if (typing(e)) return;
+    const name = Object.keys(this.tags.keys).find(n => this.tags.keys[n] === e.key);
+    const t = this.now;
+    if (name && t) { e.preventDefault(); this.save(toggle(this.tags, t.rel, name)); }
+  };
+
+  private save(tags: Tags) {
+    this.tags = tags;
+    fetch("/api/tags", { method: "PUT", body: JSON.stringify(tags) });
+  }
+
+  private clearError(e: Event) {
+    ((e.target as HTMLInputElement).form!.elements.namedItem("key") as HTMLInputElement).setCustomValidity("");
+  }
+
+  private addTag(e: SubmitEvent) {
+    e.preventDefault();
+    const f = e.target as HTMLFormElement, key = f.elements.namedItem("key") as HTMLInputElement;
+    const r = add(this.tags, (f.elements.namedItem("name") as HTMLInputElement).value, key.value);
+    key.setCustomValidity(typeof r === "string" ? r : "");
+    if (typeof r === "string") return key.reportValidity();
+    this.save(r); f.reset();
+  }
+
   render() {
-    const list = this.filtered;
+    const list = this.filtered, now = this.now;
     // ponytail: plain repeat; virtualize only if >20k rows lags
     return html`
       <input type="search" placeholder="search ${this.tracks.length} tracks" @input=${(e: Event) => this.q = (e.target as HTMLInputElement).value}>
+      <details><summary>tags</summary><div>
+        ${Object.entries(this.tags.keys).map(([n, k]) => html`
+          <button class=${now && has(this.tags, now.rel, n) ? "on" : ""} ?disabled=${!now}
+                  title="press ${k} to toggle on the playing track" @click=${() => this.save(toggle(this.tags, now!.rel, n))}>${n} <kbd>${k}</kbd></button>
+          <button title="delete tag" @click=${() => confirm(`Delete "${n}" from all tracks?`) && this.save(remove(this.tags, n))}>✕</button>`)}
+        <form @submit=${this.addTag}>
+          <input name="name" placeholder="new tag" required @input=${this.clearError}>
+          <input name="key" placeholder="key" maxlength="1" size="3" required @input=${this.clearError}>
+          <button>add</button>
+        </form>
+      </div></details>
       <div class="list">
         ${repeat(list, t => t.id, (t, i) => html`
           <div class="row ${t.id === this.nowId ? "on" : ""}" @click=${() => this.play(list, i)}>
-            <span>${t.title}</span><span>${t.artist}</span><span>${t.album}</span>
+            <span>${t.title}${(this.tags.tracks[t.rel] ?? []).map(n => html`<small class="tag">${n}</small>`)}</span><span>${t.artist}</span><span>${t.album}</span>
             <span>${fmt(t.duration_ms / 1000)}</span>
           </div>`)}
       </div>
