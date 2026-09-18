@@ -1,4 +1,4 @@
-import { LitElement, html, css } from "lit";
+import { LitElement, html, css, type PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { repeat } from "lit/directives/repeat.js";
 import { load, type Loaded } from "./pcm";
@@ -303,6 +303,10 @@ export class App extends LitElement {
     key.setCustomValidity(typeof r === "string" ? r : "");
     if (typeof r === "string") return key.reportValidity();
     this.save(r); f.reset();
+  }
+
+  updated(changed: PropertyValues) {   // keep the current row on screen (j/k, auto-advance); "nearest" is a no-op when already visible
+    if (changed.has("nowId")) this.renderRoot.querySelector(".row.on")?.scrollIntoView({ block: "nearest" });
   }
 
   render() {
