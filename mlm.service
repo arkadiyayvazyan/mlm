@@ -1,0 +1,14 @@
+[Unit]
+Description=mlm music player
+After=network.target
+
+[Service]
+User=aa
+Environment=MLM_DIR=/mnt/ex_ssd_1tb/nasvol/private/music/library
+Environment=MLM_ADDR=0.0.0.0:8080
+Environment=MLM_CACHE=/home/aa/mlm-index.json
+ExecStart=/home/aa/mlm
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
