@@ -46,7 +46,6 @@ export class Player extends LitElement {
   private t0 = 0;
   private nodes: AudioBufferSourceNode[] = [];
   private timer = 0;
-  private raf = 0;
 
   connectedCallback() {
     super.connectedCallback();
@@ -55,7 +54,7 @@ export class Player extends LitElement {
   }
   disconnectedCallback() {
     super.disconnectedCallback();
-    clearInterval(this.timer); cancelAnimationFrame(this.raf);
+    clearInterval(this.timer);
     window.removeEventListener("keydown", this.key);
   }
 
@@ -87,7 +86,7 @@ export class Player extends LitElement {
   private open(t: Track): Slot {
     const abort = new AbortController();
     const s: Slot = { id: t.id, l: load(url(t), t.ext, this.ctx!, abort.signal), abort, scheduled: 0 };
-    s.l.onProgress = () => this.tick();
+    s.l.onProgress = () => { if (!this.nodes.length) this.tick(); };   // cold start only; the 250 ms tick covers the rest
     s.l.done.catch(() => {});   // abort / network error: nothing to play, nothing to do
     return s;
   }
@@ -141,13 +140,7 @@ export class Player extends LitElement {
     this.loaded = c.l.frames ? c.l.loaded / c.l.frames : 0;
     const ended = !this.ahead.length && this.dur > 0 && now >= end;
     this.playing = ctx.state === "running" && !ended;
-    if (this.playing && !this.raf) this.raf = requestAnimationFrame(this.frame);
   }
-
-  private frame = () => {
-    this.t = this.pos;
-    this.raf = this.playing ? requestAnimationFrame(this.frame) : 0;
-  };
 
   /** Queue up to CHUNK-second buffers of slot `s` (whose frame 0 plays at ctx time `base`) within LOOKAHEAD. */
   private schedule(s: Slot, base: number) {
@@ -245,7 +238,8 @@ export class App extends LitElement {
     input[type=search] { font: inherit; width: 100%; box-sizing: border-box; padding: 8px 12px; border: 0;
                          border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
     .list { overflow-y: auto; }
-    .row { display: grid; grid-template-columns: 1fr 1fr 1fr 4em; gap: 8px; padding: 6px 16px; cursor: pointer; }
+    .row { display: grid; grid-template-columns: 1fr 1fr 1fr 4em; gap: 8px; padding: 6px 16px; cursor: pointer;
+           content-visibility: auto; contain-intrinsic-size: auto 2.2em; }
     .row:hover, .row.on { background: color-mix(in srgb, currentColor 10%, transparent); }
     .row > * { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
     .row > :last-child { text-align: right; opacity: .6; }
@@ -272,7 +266,7 @@ export class App extends LitElement {
 
   render() {
     const list = this.filtered;
-    // ponytail: plain repeat; virtualize only if >20k rows lags
+    // ponytail: plain repeat, content-visibility skips off-screen rows; JS virtual list only if >20k rows lags
     return html`
       <input type="search" placeholder="search ${this.tracks.length} tracks" @input=${(e: Event) => this.q = (e.target as HTMLInputElement).value}>
       <div class="list">
