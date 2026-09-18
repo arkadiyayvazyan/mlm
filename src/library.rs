@@ -20,6 +20,7 @@ pub struct Track {
     pub album: String,
     pub track_no: u32,
     pub duration_ms: u64,
+    pub rate: u32,
     pub ext: String,
 }
 
@@ -41,6 +42,8 @@ struct CachedTrack {
     album: String,
     track_no: u32,
     duration_ms: u64,
+    #[serde(default)]
+    rate: u32,
 }
 
 fn id_of(path: &Path) -> u64 {
@@ -61,6 +64,7 @@ fn mtime(path: &Path) -> u64 {
 fn read_tags(path: &Path) -> Option<CachedTrack> {
     let f = lofty::read_from_path(path).ok()?;
     let dur = f.properties().duration().as_millis() as u64;
+    let rate = f.properties().sample_rate().unwrap_or(0);
     let tag = f.primary_tag().or_else(|| f.first_tag());
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let get = |k: ItemKey| tag.and_then(|t| t.get_string(&k)).map(str::to_owned);
@@ -70,6 +74,7 @@ fn read_tags(path: &Path) -> Option<CachedTrack> {
         album: get(ItemKey::AlbumTitle).unwrap_or_default(),
         track_no: tag.and_then(|t| t.track()).unwrap_or(0),
         duration_ms: dur,
+        rate,
     })
 }
 
@@ -93,7 +98,7 @@ pub fn scan(dir: &Path, cache_path: &Path) -> Vec<Track> {
         }
         let mt = mtime(p);
         let t = match old.0.get(p) {
-            Some((m, t)) if *m == mt => t.clone(),
+            Some((m, t)) if *m == mt && t.rate != 0 => t.clone(), // rate==0: pre-rate cache entry, re-tag
             _ => match read_tags(p) {
                 Some(t) => { n += 1; t }
                 None => continue,
@@ -129,6 +134,7 @@ fn to_tracks(c: Cache) -> Vec<Track> {
             album: t.album,
             track_no: t.track_no,
             duration_ms: t.duration_ms,
+            rate: t.rate,
             path,
         })
         .collect();

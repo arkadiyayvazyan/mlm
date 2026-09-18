@@ -5,7 +5,7 @@ import { load, type Loaded } from "./pcm";
 
 type Track = {
   id: number; title: string; artist: string; album: string;
-  track_no: number; duration_ms: number; ext: string;
+  track_no: number; duration_ms: number; rate: number; ext: string;
 };
 
 const url = (t: Track) => `/api/tracks/${t.id}/stream`;
@@ -74,7 +74,9 @@ export class Player extends LitElement {
   private start(i: number, offset = 0) {
     const t = this.queue[i];
     if (!t) return;
-    const ctx = this.ctx ??= Object.assign(new AudioContext(), { onstatechange: () => this.tick() });
+    // ctx runs at the track's rate so chunk boundaries never go through the per-node resampler (clicks)
+    if (this.ctx && t.rate && this.ctx.sampleRate !== t.rate) { this.ctx.close(); this.ctx = undefined; }
+    const ctx = this.ctx ??= Object.assign(new AudioContext(t.rate ? { sampleRate: t.rate } : {}), { onstatechange: () => this.tick() });
     if (ctx.state === "suspended") ctx.resume();
     for (const n of this.nodes) { n.stop(); n.disconnect(); }
     this.nodes = [];
@@ -109,6 +111,11 @@ export class Player extends LitElement {
       end = this.t0 + dur(this.cur.l);
     }
     const c = this.cur;
+    // nothing sounding and the next chunk is already due (cold start, seek past loaded): re-anchor instead of skipping
+    if (!this.nodes.length && c.l.loaded > c.scheduled && this.t0 + c.scheduled / c.l.rate < now) {
+      this.t0 = now - c.scheduled / c.l.rate;
+      end = this.t0 + dur(c.l);
+    }
     this.schedule(c, this.t0);
     if (this.nxt && dur(c.l)) this.schedule(this.nxt, end);
     this.dur = dur(c.l);
