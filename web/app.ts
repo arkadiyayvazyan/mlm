@@ -47,8 +47,28 @@ export class Player extends LitElement {
   private timer = 0;
   private raf = 0;
 
-  connectedCallback() { super.connectedCallback(); this.timer = window.setInterval(() => this.tick(), 250); }
-  disconnectedCallback() { super.disconnectedCallback(); clearInterval(this.timer); cancelAnimationFrame(this.raf); }
+  connectedCallback() {
+    super.connectedCallback();
+    this.timer = window.setInterval(() => this.tick(), 250);
+    window.addEventListener("keydown", this.key);
+  }
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    clearInterval(this.timer); cancelAnimationFrame(this.raf);
+    window.removeEventListener("keydown", this.key);
+  }
+
+  // vim-style: j/k/space = play/pause, h/l = -/+ 1 min, ? = help. Ignored while typing in an input.
+  private key = (e: KeyboardEvent) => {
+    if ((e.target as HTMLElement).tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
+    const help = this.renderRoot.querySelector("dialog")!;
+    const act: Record<string, () => void> = {
+      j: () => this.toggle(), k: () => this.toggle(), " ": () => this.toggle(),
+      h: () => this.skip(-60), l: () => this.skip(60),
+      "?": () => help.open ? help.close() : help.showModal(),
+    };
+    if (act[e.key]) { e.preventDefault(); act[e.key](); }
+  };
 
   get track() { return this.queue[this.i]; }
   get pos() { return this.ctx && this.cur ? Math.min(Math.max(this.ctx.currentTime - this.t0, 0), this.dur) : 0; }
@@ -61,6 +81,7 @@ export class Player extends LitElement {
   prev() { this.pos > 3 ? this.start(this.i, 0) : this.start(this.i - 1); }
   seek(sec: number) { if (this.cur) this.start(this.i, sec); }   // ponytail: no range re-fetch on seek; whole AIFF lands in ~2 s on LAN
   toggle() { const c = this.ctx; if (c) c.state === "running" ? c.suspend() : c.resume(); }
+  skip(s: number) { if (this.cur) this.seek(Math.min(Math.max(this.pos + s, 0), this.dur)); }
 
   private open(t: Track): Slot {
     const abort = new AbortController();
@@ -164,7 +185,8 @@ export class Player extends LitElement {
         <mlm-wave .peaks=${this.cur?.l.peaks} .loadedFrac=${this.loaded} .progress=${this.dur ? this.t / this.dur : 0}
                   @seek=${(e: CustomEvent<number>) => this.seek(e.detail * this.dur)}></mlm-wave>
       </div>
-      <div>${fmt(this.t)} / ${fmt(this.dur)}</div>`;
+      <div>${fmt(this.t)} / ${fmt(this.dur)}</div>
+      <dialog><b>Keys</b><br>j / k / space — play / pause<br>h / l — back / forward 1 min<br>? — this help<br><small>Esc closes</small></dialog>`;
   }
 }
 
