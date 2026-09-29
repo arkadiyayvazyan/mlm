@@ -18,7 +18,7 @@ use web_sys::{
 use crate::pcm::{self, BINS};
 use crate::Track;
 
-const CAP: usize = 1 << 18; // ring frames, ~6 s at 44.1 kHz: rides out background-tab timer throttling (1 tick/s)
+const CAP: usize = 1 << 20; // ring frames, ~24 s at 44.1 kHz: rides out background-tab timer throttling (1 tick/s) and app-switch stalls
 const CHUNK: usize = 8192; // frames converted per ring write
 // ponytail: PCM kept whole in memory (~10 MB/min at 16-bit/44.1k stereo); window of cur + 2. Range-fetch on seek if phones choke
 const PRELOAD: usize = 2; // tracks fetched ahead of the playing one
@@ -239,6 +239,26 @@ impl Player {
         self.tick();
     }
 
+    /// ponytail: temporary dropout probe, reports to the Pi's journal via /api/log; delete once the app-switch gap is understood
+    pub fn probe(&self, last: &mut Option<(f64, i32, i32, bool)>) {
+        let (Some(ring), Some(ctx)) = (&self.ring, &self.ctx) else { return };
+        let (now, r, rate) = (js_sys::Date::now(), ring.read(), ctx.sample_rate() as f64);
+        let buf = ring.w.wrapping_sub(r);
+        let hidden = web_sys::window().unwrap().document().unwrap().hidden();
+        let log = |m: String| web_sys::window().unwrap().navigator().send_beacon_with_opt_str("/api/log", Some(&m));
+        if let Some((t, r0, b0, h0)) = *last {
+            let (dt, played) = ((now - t) / 1000.0, r.wrapping_sub(r0) as f64 / rate);
+            if hidden != h0 {
+                let _ = log(format!("hidden {hidden}, buffered {:.2}s, ctx {:?}", buf as f64 / rate, ctx.state()));
+            }
+            if self.playing() && dt - played > 0.15 {
+                let _ = log(format!("stall {:.2}s of {dt:.2}s, buffered {:.2}s -> {:.2}s, hidden {hidden}, ctx {:?}",
+                    dt - played, b0 as f64 / rate, buf as f64 / rate, ctx.state()));
+            }
+        }
+        *last = Some((now, r, buf, hidden));
+    }
+
     /// Called every 50 ms: top the ring up, track what the worklet has played, keep the preload window.
     pub fn tick(&mut self) {
         let (Some(ring), Some(ctx)) = (&mut self.ring, self.ctx.clone()) else { return };
@@ -299,8 +319,6 @@ impl Player {
 
 fn new_ctx(rate: u32, sab: &SharedArrayBuffer) -> AudioContext {
     let o = AudioContextOptions::new();
-    // the default "interactive" gets a ~10 ms low-latency output buffer that drops out (~1 s) when switching apps
-    o.set_latency_hint(&"playback".into());
     if rate > 0 {
         o.set_sample_rate(rate as f32);
     }

@@ -77,6 +77,8 @@ async fn main() {
         .route("/api/tracks/{id}/art", get(art))
         .route("/api/tags", get(tags_get))
         .route("/api/tags/ops", post(tags_ops))
+        // ponytail: temporary, the UI's dropout probe logs here (journalctl -u mlm)
+        .route("/api/log", post(|body: String| async move { eprintln!("client: {body}"); StatusCode::NO_CONTENT }))
         .route("/api/rescan", post(|State(app): State<App>| async move { app.rescan(); StatusCode::ACCEPTED }))
         .with_state(app);
 

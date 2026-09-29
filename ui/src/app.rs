@@ -82,10 +82,12 @@ impl App {
         }
         offer.forget();
         let mut media = crate::media::Media::new(&player);
+        let mut probe = None;
         let tick = Closure::<dyn FnMut()>::new(move || {
             let mut p = p.borrow_mut();
             p.tick();
             media.sync(&p);
+            p.probe(&mut probe);
         });
         web_sys::window()
             .unwrap()
