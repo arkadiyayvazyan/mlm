@@ -25,6 +25,8 @@ pub struct Track {
     pub ext: String,
     /// Path relative to the music root: the stable key for tags (`id` changes across Rust releases).
     pub rel: String,
+    /// "Date added", unix seconds: see `added`.
+    pub added: u64,
 }
 
 impl Track {
@@ -65,6 +67,24 @@ fn mtime(path: &Path) -> u64 {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// When the file came into the library: the earlier of its birth time (copied onto this disk) and mtime
+/// (the download time, when a copy preserved it). mtime alone is useless here: tag writers bump it.
+fn added(path: &Path) -> u64 {
+    birth(path).map_or(mtime(path), |b| b.min(mtime(path)))
+}
+
+/// statx birth time. std's `Metadata::created` isn't implemented on musl (the Pi build), nor is
+/// `libc::statx`, so this is the raw syscall; the kernel's struct statx layout is fixed.
+fn birth(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    const STATX_BTIME: u32 = 0x800;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = [0u64; 32]; // struct statx is 256 bytes: stx_mask is the first u32, stx_btime.tv_sec is at byte 80
+    // SAFETY: buf is a writable, 8-aligned 256-byte buffer, the size of struct statx; c is NUL-terminated
+    let r = unsafe { libc::syscall(libc::SYS_statx, libc::AT_FDCWD, c.as_ptr(), 0, STATX_BTIME, buf.as_mut_ptr()) };
+    (r == 0 && buf[0] as u32 & STATX_BTIME != 0 && buf[10] > 0).then_some(buf[10])
 }
 
 fn read_tags(path: &Path) -> Option<CachedTrack> {
@@ -144,6 +164,7 @@ fn to_tracks(dir: &Path, c: Cache) -> Vec<Track> {
             rate: t.rate,
             bpm: t.bpm.unwrap_or(0),
             rel: path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().into_owned(),
+            added: added(&path),
             path,
         })
         .collect();
@@ -181,6 +202,8 @@ mod tests {
         let t = &scan(&dir, &cache)[0];
         assert_eq!((t.bpm, t.title.as_str()), (128, "t"));
         assert_eq!(scan(&dir, &cache)[0].bpm, 128); // second scan served from refreshed cache
+        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert!((now - 60..=now).contains(&added(&wav)), "added = just now: {}", added(&wav));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,0 +1,12 @@
+# HTTPS in front of mlm: the egui UI's AudioWorklet + SharedArrayBuffer need a secure context.
+# mlm.lan has no public cert, so Caddy's local CA signs it; trust its root.crt on each client
+# (see README). nginx owns :80 on the Pi, hence no HTTP->HTTPS redirect listener.
+{
+	auto_https disable_redirects
+	skip_install_trust
+}
+
+mlm.lan {
+	tls internal
+	reverse_proxy localhost:8080
+}

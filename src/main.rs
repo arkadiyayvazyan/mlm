@@ -1,4 +1,6 @@
 mod aiff;
+mod bpm;
+mod decode;
 mod library;
 
 use std::collections::BTreeMap;
@@ -15,6 +17,9 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use library::Track;
+
+const COOP: header::HeaderName = header::HeaderName::from_static("cross-origin-opener-policy");
+const COEP: header::HeaderName = header::HeaderName::from_static("cross-origin-embedder-policy");
 
 #[derive(Clone)]
 struct App {
@@ -50,11 +55,18 @@ async fn main() {
     app.rescan();
 
     let router = Router::new()
-        .route("/", get(|| async { ([(header::CONTENT_TYPE, "text/html")], include_bytes!("../web/index.html").as_slice()) }))
-        .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("../static/app.js").as_slice()) }))
+        .route("/", get(index))
+        .route("/egui", get(index)) // where the UI lived before it replaced the Lit one; installed PWAs may still open it
+        .route("/mlm-ui.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("../static/mlm-ui.js").as_slice()) }))
+        .route("/mlm-ui_bg.wasm", get(|| async { ([(header::CONTENT_TYPE, "application/wasm")], include_bytes!("../static/mlm-ui_bg.wasm").as_slice()) }))
+        .route("/manifest.json", get(|| async { ([(header::CONTENT_TYPE, "application/manifest+json")], include_bytes!("../ui/manifest.json").as_slice()) }))
+        .route("/icon-192.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../ui/icon-192.png").as_slice()) }))
+        .route("/icon-512.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../ui/icon-512.png").as_slice()) }))
+        .route("/worklet.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("../ui/worklet.js").as_slice()) }))
         .route("/api/tracks", get(tracks))
-        .route("/api/tracks/{id}/stream", get(stream))
         .route("/api/tracks/{id}/file", get(file))
+        .route("/api/tracks/{id}/pcm", get(pcm))
+        .route("/api/tracks/{id}/analyze", post(analyze))
         .route("/api/tags", get(tags_get).put(tags_put))
         .route("/api/rescan", post(|State(app): State<App>| async move { app.rescan(); StatusCode::ACCEPTED }))
         .with_state(app);
@@ -96,21 +108,51 @@ async fn tags_put(State(app): State<App>, body: Bytes) -> StatusCode {
     }
 }
 
-async fn stream(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Response {
+/// The UI page. SharedArrayBuffer (the player's audio ring) needs a cross-origin isolated page.
+async fn index() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/html"), (COOP, "same-origin"), (COEP, "require-corp")], include_bytes!("../ui/index.html").as_slice())
+}
+
+/// Any format as a streamed WAV (the egui player's input): AIFF byte-swapped, the rest decoded.
+async fn pcm(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Response {
     let tracks = app.tracks();
     let Some(t) = tracks.iter().find(|t| t.id == id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !t.is_aiff() {
-        return ServeFile::new(&t.path).oneshot(req).await.into_response();
+    if t.is_aiff() {
+        return match stream_aiff(&t.path, req.headers()).await {
+            Ok(r) => r,
+            Err(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()).into_response(),
+        };
     }
-    match stream_aiff(&t.path, req.headers()).await {
-        Ok(r) => r,
-        Err(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()).into_response(),
+    let body = Body::from_stream(decode::stream(t.path.clone(), t.duration_ms));
+    ([(header::CONTENT_TYPE, "audio/wav")], body).into_response()
+}
+
+/// Detect the tempo, write it to the file's BPM tag, re-index. `{"bpm": 124}`, or 422 when no tempo is found.
+async fn analyze(State(app): State<App>, Path(id): Path<u64>) -> Response {
+    let Some(path) = app.tracks().iter().find(|t| t.id == id).map(|t| t.path.clone()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let r = tokio::task::spawn_blocking(move || -> std::io::Result<Option<u32>> {
+        let Some(bpm) = bpm::detect(&path)? else { return Ok(None) };
+        let bpm = bpm.round() as u32;
+        bpm::write(&path, bpm)?;
+        Ok(Some(bpm))
+    })
+    .await
+    .unwrap();
+    match r {
+        Ok(Some(bpm)) => {
+            app.rescan(); // only this file's mtime changed: one re-tag
+            ([(header::CONTENT_TYPE, "application/json")], format!(r#"{{"bpm":{bpm}}}"#)).into_response()
+        }
+        Ok(None) => (StatusCode::UNPROCESSABLE_ENTITY, "no tempo found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-/// The original file, untouched (Shift+D in the player); the browser names it via the anchor's `download`.
+/// The original file, untouched (ctrl+d in the UI); the browser names it via the anchor's `download`.
 async fn file(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Response {
     match app.tracks().iter().find(|t| t.id == id) {
         Some(t) => ServeFile::new(&t.path).oneshot(req).await.into_response(),

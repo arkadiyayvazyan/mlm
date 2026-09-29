@@ -1,5 +1,5 @@
 target/
 node_modules/
 mlm-index.json
-static/app.js
+static/
 .claude/worktrees/

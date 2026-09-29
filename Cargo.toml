@@ -1,3 +1,6 @@
+[workspace]
+members = ["ui"]
+
 [package]
 name = "mlm"
 version = "0.1.0"
@@ -14,6 +17,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
 bytes = "1"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "flac", "wav", "pcm", "ogg", "vorbis", "alac", "aiff"] }
+libc = "0.2"
+id3 = "1"
 
 [profile.release]
 lto = true
