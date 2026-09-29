@@ -270,6 +270,8 @@ impl Player {
 
 fn new_ctx(rate: u32, sab: &SharedArrayBuffer) -> AudioContext {
     let o = AudioContextOptions::new();
+    // the default "interactive" gets a ~10 ms low-latency output buffer that drops out (~1 s) when switching apps
+    o.set_latency_hint(&"playback".into());
     if rate > 0 {
         o.set_sample_rate(rate as f32);
     }
