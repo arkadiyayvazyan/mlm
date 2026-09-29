@@ -19,6 +19,9 @@
 </head>
 <body>
 <canvas id="mlm"></canvas>
-<script type="module">import init from "/mlm-ui.js"; init();</script>
+<script type="module">
+import init from "/mlm-ui.js"; init();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js"); // offline: ui/sw.js
+</script>
 </body>
 </html>

@@ -16,6 +16,8 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
   "AbortController", "AbortSignal", "AudioContext", "AudioContextOptions", "AudioContextState",
   "AudioDestinationNode", "AudioNode", "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions", "BaseAudioContext",
-  "console", "Document", "EventTarget", "KeyboardEvent", "Element", "HtmlAnchorElement", "HtmlElement", "HtmlCanvasElement", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit",
+  "Blob", "Cache", "CacheStorage", "console", "Document", "Event", "EventTarget", "File", "FilePropertyBag", "HtmlAudioElement", "HtmlMediaElement",
+  "KeyboardEvent", "MediaImage", "MediaMetadata", "MediaMetadataInit", "MediaPositionState", "MediaQueryList", "MediaSession",
+  "MediaSessionAction", "MediaSessionActionDetails", "MediaSessionPlaybackState", "Navigator", "Performance", "ShareData", "Storage", "StorageManager", "Headers", "Element", "HtmlAnchorElement", "HtmlElement", "HtmlCanvasElement", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit",
   "Response", "Window", "Worklet",
 ] }

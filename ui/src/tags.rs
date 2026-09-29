@@ -1,4 +1,6 @@
-//! User tags: name -> shortcut key, and track (relative path) -> tag names. The app PUTs the whole doc.
+//! User tags: name -> shortcut key, and track (relative path) -> tag names. Shared by the UI and the server
+//! (`src/main.rs` includes this file): edits travel as `Op`s that both sides apply, so offline phones and stale
+//! tabs never overwrite each other's changes.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,29 @@ pub struct Tags {
     pub hues: BTreeMap<String, u16>, // tag name -> pastel hue in degrees
 }
 
+/// One tag edit. Idempotent: `Tag` says on or off rather than "toggle", so replaying a queued op is harmless.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum Op {
+    Tag { rel: String, name: String, on: bool },
+    Define { name: String, key: String, hue: u16 }, // create a tag, or set its key / hue
+    Remove { name: String },
+}
+
 impl Tags {
+    pub fn apply(&mut self, op: &Op) {
+        match op {
+            // a tag deleted elsewhere meanwhile isn't resurrected by a queued "on"
+            Op::Tag { rel, name, on } if *on != self.has(rel, name) && (!on || self.keys.contains_key(name)) => self.toggle(rel, name),
+            Op::Tag { .. } => {}
+            Op::Define { name, key, hue } => {
+                self.keys.insert(name.clone(), key.clone());
+                self.hues.insert(name.clone(), *hue);
+            }
+            Op::Remove { name } => self.remove(name),
+        }
+    }
+
     pub fn of(&self, rel: &str) -> &[String] {
         self.tracks.get(rel).map_or(&[], |v| v)
     }
@@ -106,6 +130,24 @@ fn add_toggle_remove() {
     assert_eq!(t.of("a/1.aiff"), ["chill"]);
     t.remove("chill");
     assert!(t.tracks.is_empty());
+}
+
+#[test]
+fn ops_replay_and_merge() {
+    let mut a = Tags::default();
+    let ops = [
+        Op::Define { name: "fav".into(), key: "f".into(), hue: 10 },
+        Op::Tag { rel: "x.aiff".into(), name: "fav".into(), on: true },
+        Op::Tag { rel: "x.aiff".into(), name: "fav".into(), on: true }, // replayed: still on once
+    ];
+    ops.iter().for_each(|o| a.apply(o));
+    assert_eq!(a.of("x.aiff"), ["fav"]);
+    let mut b = a.clone(); // another device removed the tag while this one was offline...
+    b.apply(&Op::Remove { name: "fav".into() });
+    b.apply(&Op::Tag { rel: "y.aiff".into(), name: "fav".into(), on: true }); // ...then this phone's queued op lands
+    assert!(b.tracks.is_empty() && b.keys.is_empty());
+    let json = serde_json::to_string(&ops[1]).unwrap();
+    assert_eq!(json, r#"{"op":"tag","rel":"x.aiff","name":"fav","on":true}"#);
 }
 
 #[test]

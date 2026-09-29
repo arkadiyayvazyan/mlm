@@ -11,11 +11,14 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{RequestInit, Response};
 
 use crate::player::Player;
-use crate::tags::Tags;
+use crate::offline::Offline;
+use crate::tags::{Op, Tags};
 use crate::{fmt, Track};
 
 const ROW: f32 = 26.0;
 const NARROW: f32 = 600.0; // below this width (phones): two-line rows, touch-sized controls
+const ICON: f32 = 20.0; // the offline-copy column before the filename
+const OFFLINE_ICON: &str = "💾";
 
 pub struct App {
     tracks: Vec<Track>,
@@ -32,26 +35,60 @@ pub struct App {
     sort: Option<(usize, bool)>, // column, descending; None = library order
     analyzed: Rc<RefCell<Option<(u64, Result<u32, String>)>>>, // ctrl+a result lands here
     status: Option<(String, f64)>, // message and the egui time it disappears at
+    note: Rc<RefCell<Option<String>>>, // status messages from async work (share)
+    can_share: bool,                   // the browser can share files (Android / iOS share sheet)
+    shared: Rc<RefCell<Option<(u64, web_sys::File)>>>, // last prepared share, reused by a second tap
+    install: Rc<RefCell<Option<JsValue>>>, // stashed beforeinstallprompt event: an "install app" button is offered
+    off: Offline,
+    last_flush: f64, // egui time of the last retry of queued tag edits
+    gen: u64,        // bumped whenever tracks or tags change: the filtered + sorted list is rebuilt only then
+    list_key: (String, Option<(usize, bool)>, u64), // (query, sort, gen) the cached list was built for
+    list_idx: Vec<usize>, // that list, as indices into `tracks`
+    fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> Option<T> {
+/// GET a JSON API; `unreachable` is set when sw.js had to answer from its cache (the Pi is out of reach).
+async fn get_json<T: serde::de::DeserializeOwned>(url: &str, unreachable: &std::cell::Cell<bool>) -> Option<T> {
     let res: Response = JsFuture::from(web_sys::window()?.fetch_with_str(url)).await.ok()?.dyn_into().ok()?;
+    if res.headers().has("x-mlm-offline").unwrap_or(false) {
+        unreachable.set(true);
+    }
     serde_json::from_str(&JsFuture::from(res.text().ok()?).await.ok()?.as_string()?).ok()
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let inbox = Rc::new(RefCell::new(None));
-        let (ib, ctx) = (inbox.clone(), cc.egui_ctx.clone());
+        let off = Offline::new(&cc.egui_ctx);
+        let (ib, ctx, unreachable) = (inbox.clone(), cc.egui_ctx.clone(), off.unreachable.clone());
         spawn_local(async move {
-            let (t, g) = (get_json("/api/tracks").await, get_json("/api/tags").await);
+            let (t, g) = (get_json("/api/tracks", &unreachable).await, get_json("/api/tags", &unreachable).await);
             *ib.borrow_mut() = Some((t.unwrap_or_default(), g.unwrap_or_default()));
             ctx.request_repaint();
         });
         // the scheduler runs off a timer, not the frame loop: egui doesn't paint while the tab is hidden
         let player = Rc::new(RefCell::new(Player::new()));
         let p = player.clone();
-        let tick = Closure::<dyn FnMut()>::new(move || p.borrow_mut().tick());
+        // the browser offers installing: keep its event for our own button instead of its mini-infobar
+        let install: Rc<RefCell<Option<JsValue>>> = Rc::default();
+        let (i, ctx) = (install.clone(), cc.egui_ctx.clone());
+        let offer = Closure::<dyn Fn(web_sys::Event)>::new(move |e: web_sys::Event| {
+            e.prevent_default();
+            *i.borrow_mut() = (e.type_() == "beforeinstallprompt").then(|| e.into());
+            ctx.request_repaint();
+        });
+        for ev in ["beforeinstallprompt", "appinstalled"] {
+            let _ = web_sys::window().unwrap().add_event_listener_with_callback(ev, offer.as_ref().unchecked_ref());
+        }
+        offer.forget();
+        let mut media = crate::media::Media::new(&player);
+        let mut probe = None;
+        let tick = Closure::<dyn FnMut()>::new(move || {
+            let mut p = p.borrow_mut();
+            p.tick();
+            media.sync(&p);
+            p.probe(&mut probe);
+        });
         web_sys::window()
             .unwrap()
             .set_interval_with_callback_and_timeout_and_arguments_0(tick.as_ref().unchecked_ref(), 50)
@@ -60,15 +97,30 @@ impl App {
         Self {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
-            analyzed: Rc::default(), status: None,
+            analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
+            off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
-    fn save_tags(&self) {
-        let init = RequestInit::new();
-        init.set_method("PUT");
-        init.set_body(&serde_json::to_string(&self.tags).unwrap().into());
-        let _ = web_sys::window().unwrap().fetch_with_str_and_init("/api/tags", &init);
+    /// A tag edit: applied here at once, queued, and sent to the Pi (now, or when it's reachable again).
+    fn edit(&mut self, op: Op) {
+        self.gen += 1;
+        self.tags.apply(&op);
+        self.off.queue(op);
+        self.off.flush();
+    }
+
+    /// Tags without a color (new, or from before colors) get one, stored on the server like any edit.
+    fn color_new_tags(&mut self) {
+        let before: Vec<String> = self.tags.keys.keys().filter(|n| !self.tags.hues.contains_key(*n)).cloned().collect();
+        if self.tags.color_missing(js_sys::Math::random) {
+            self.gen += 1;
+            for name in before {
+                let (key, hue) = (self.tags.keys[&name].clone(), self.tags.hues[&name]);
+                self.off.queue(Op::Define { name, key, hue });
+            }
+            self.off.flush();
+        }
     }
 
     fn now_rel(&self) -> Option<String> {
@@ -98,6 +150,52 @@ impl App {
             *inbox.borrow_mut() = Some((t.id, r.map_err(|e| e.as_string().unwrap_or_else(|| "network error".into()))));
             ctx.request_repaint();
         });
+    }
+
+    /// Hand the playing track to the share sheet. Android won't take AIFF, so AIFF goes as a WAV built from the PCM
+    /// already in memory (instant, lossless, no tags); other formats are fetched as the original file. A fetch can
+    /// outlast the tap's user activation: then the prepared file waits and the next tap shares it.
+    fn share(&mut self) {
+        let Some(t) = self.player.borrow().track().cloned() else { return };
+        if let Some((id, f)) = self.shared.borrow().clone() {
+            if id == t.id {
+                return share_now(f, t.title.clone(), self.note.clone());
+            }
+        }
+        let name = filename(&t).to_owned();
+        if matches!(t.ext.as_str(), "mp3" | "m4a" | "wav" | "flac" | "ogg" | "oga" | "opus") {
+            self.status = Some(("preparing…".into(), f64::INFINITY));
+            let (shared, note) = (self.shared.clone(), self.note.clone());
+            spawn_local(async move {
+                let r: Result<web_sys::File, JsValue> = async {
+                    let res: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(&format!("/api/tracks/{}/file", t.id))).await?.dyn_into()?;
+                    let blob: web_sys::Blob = JsFuture::from(res.blob()?).await?.dyn_into()?;
+                    let o = web_sys::FilePropertyBag::new();
+                    o.set_type(&blob.type_());
+                    web_sys::File::new_with_blob_sequence_and_options(&js_sys::Array::of1(&blob), &name, &o)
+                }
+                .await;
+                match r {
+                    Ok(f) => {
+                        *shared.borrow_mut() = Some((t.id, f.clone()));
+                        *note.borrow_mut() = Some(String::new()); // clears "preparing…"
+                        share_now(f, t.title, note);
+                    }
+                    Err(_) => *note.borrow_mut() = Some("share: download failed".into()),
+                }
+            });
+            return;
+        }
+        let Some(wav) = self.player.borrow().cur().and_then(|l| l.wav()) else {
+            *self.note.borrow_mut() = Some("still loading, try again in a moment".into());
+            return;
+        };
+        let o = web_sys::FilePropertyBag::new();
+        o.set_type("audio/wav");
+        let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
+        let f = web_sys::File::new_with_u8_array_sequence_and_options(&js_sys::Array::of1(&js_sys::Uint8Array::from(&wav[..])), &format!("{stem}.wav"), &o).unwrap();
+        *self.shared.borrow_mut() = Some((t.id, f.clone()));
+        share_now(f, t.title, self.note.clone());
     }
 
     /// vim-style: space = play/pause, j/k = next/prev, h/l = -/+ 1 min, ? = help, tag keys toggle tags;
@@ -133,8 +231,8 @@ impl App {
                     drop(p);
                     let name = self.tags.keys.iter().find(|(_, v)| **v == k).map(|(n, _)| n.clone());
                     if let (Some(name), Some(rel)) = (name, self.now_rel()) {
-                        self.tags.toggle(&rel, &name);
-                        self.save_tags();
+                        let on = !self.tags.has(&rel, &name);
+                        self.edit(Op::Tag { rel, name, on });
                     }
                 }
             }
@@ -149,14 +247,12 @@ impl App {
                 // always full pastel; a bright outline marks tags on the playing track
                 let stroke = if on { egui::Stroke::new(2.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
                 let b = ui.add(Button::new(RichText::new(format!("{n}  {k}")).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke));
-                if b.on_hover_text(format!("press {k} to toggle on the playing track")).clicked() && now.is_some() {
-                    self.tags.toggle(now.as_ref().unwrap(), &n);
-                    self.save_tags();
+                if let (true, Some(rel)) = (b.on_hover_text(format!("press {k} to toggle on the playing track")).clicked(), now.clone()) {
+                    self.edit(Op::Tag { on: !on, rel, name: n.clone() });
                 }
                 let confirm = |m: &str| web_sys::window().unwrap().confirm_with_message(m).unwrap_or(false);
                 if ui.button("🗙").on_hover_text("delete tag").clicked() && confirm(&format!("Delete \"{n}\" from all tracks?")) {
-                    self.tags.remove(&n);
-                    self.save_tags();
+                    self.edit(Op::Remove { name: n.clone() });
                 }
             }
             let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(100.0));
@@ -168,8 +264,7 @@ impl App {
             if ui.button("add").clicked() || enter {
                 match self.tags.add(&self.new_name, &self.new_key) {
                     Ok(()) => {
-                        self.tags.color_missing(js_sys::Math::random);
-                        self.save_tags();
+                        self.color_new_tags(); // queues the new tag's Define (key + hue)
                         self.new_name.clear();
                         self.new_key.clear();
                     }
@@ -183,47 +278,77 @@ impl App {
     }
 
     fn player_bar(&mut self, ui: &mut Ui) {
-        let mut p = self.player.borrow_mut();
+        let player = self.player.clone();
+        let mut p = player.borrow_mut();
         if !p.supported() {
             ui.colored_label(ui.visuals().error_fg_color, "playback needs a cross-origin isolated page: open over HTTPS or localhost");
             return;
         }
         let time = format!("{} / {}", fmt(p.pos()), fmt(p.dur()));
         if ui.available_width() < NARROW {
-            now_playing(ui, &mut p);
+            // phones: time beside the title, and the Ctrl+ shortcuts as buttons next to the controls
+            if now_playing(ui, &mut p, Some(time)) {
+                self.fps = if self.fps.is_some() { None } else { Some((0.0, 0.0)) };
+            }
+            let (mut share, mut bpm) = (false, false);
             ui.horizontal(|ui| {
                 controls(ui, &mut p, 22.0, vec2(56.0, 40.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(time));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(40.0, 40.0));
+                    share = self.can_share && ui.add(b("share")).clicked();
+                    bpm = ui.add(b("bpm")).clicked();
+                    if ui.add(b("⬇")).clicked() {
+                        p.download();
+                    }
+                });
             });
+            drop(p);
+            if bpm {
+                self.analyze(&ui.ctx().clone());
+            }
+            if share {
+                self.share();
+            }
             return;
         }
         ui.horizontal(|ui| {
             controls(ui, &mut p, 14.0, Vec2::ZERO);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(time);
-                ui.vertical(|ui| now_playing(ui, &mut p));
+                if ui.add(Label::new(time).sense(Sense::click())).on_hover_text("tap: frame rate").clicked() {
+                    self.fps = if self.fps.is_some() { None } else { Some((0.0, 0.0)) };
+                }
+                ui.vertical(|ui| now_playing(ui, &mut p, None));
             });
         });
     }
 
     fn list(&mut self, ui: &mut Ui) {
-        let q = self.q.trim().to_lowercase();
-        // ponytail: filter re-run every frame; cache on (q, tags) if 20k+ tracks lag
-        let mut list: Vec<&Track> = self.tracks.iter()
-            .filter(|t| q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q))
-            .collect();
-        if let Some((c, desc)) = self.sort {
-            match c {
-                0 => list.sort_by_cached_key(|t| filename(t).to_lowercase()),
-                1 => list.sort_by_cached_key(|t| self.tags.of(&t.rel).join(" ")),
-                2 => list.sort_by_key(|t| t.duration_ms),
-                3 => list.sort_by_key(|t| t.bpm),
-                _ => list.sort_by_key(|t| t.added),
+        // filter + sort only when the query, sort or data changed: every frame costs too much on a phone
+        let key = (self.q.clone(), self.sort, self.gen);
+        if key != self.list_key {
+            let q = self.q.trim().to_lowercase();
+            let mut idx: Vec<usize> = (0..self.tracks.len())
+                .filter(|&i| {
+                    let t = &self.tracks[i];
+                    q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q)
+                })
+                .collect();
+            let tr = &self.tracks;
+            if let Some((c, desc)) = self.sort {
+                match c {
+                    0 => idx.sort_by_cached_key(|&i| filename(&tr[i]).to_lowercase()),
+                    1 => idx.sort_by_cached_key(|&i| self.tags.of(&tr[i].rel).join(" ")),
+                    2 => idx.sort_by_key(|&i| tr[i].duration_ms),
+                    3 => idx.sort_by_key(|&i| tr[i].bpm),
+                    _ => idx.sort_by_key(|&i| tr[i].added),
+                }
+                if desc {
+                    idx.reverse();
+                }
             }
-            if desc {
-                list.reverse();
-            }
+            (self.list_idx, self.list_key) = (idx, key);
         }
+        let list: Vec<&Track> = self.list_idx.iter().map(|&i| &self.tracks[i]).collect();
         let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color()); // one step brighter than egui defaults: easier to read
         let narrow = ui.available_width() < NARROW;
         let (row_h, hdr_h) = if narrow { (52.0, 36.0) } else { (ROW, ROW) };
@@ -253,6 +378,8 @@ impl App {
             }
         }
         let hl = ui.visuals().widgets.hovered.weak_bg_fill;
+        let (have, busy, offline) = (self.off.have.borrow(), self.off.busy.borrow(), self.off.unreachable.get());
+        let mut hold = None;
         let out = sa.show_viewport(ui, |ui, vp| {
             ui.set_height(row_h * list.len() as f32);
             let top = ui.max_rect().min;
@@ -269,6 +396,13 @@ impl App {
                 if r.clicked() {
                     clicked = Some(k);
                 }
+                if r.secondary_clicked() {
+                    hold = Some(k); // long press on a phone, right click on desktop: offline copy on / off
+                }
+                // Pi out of reach: tracks without an offline copy can't play, show them faded
+                let fade = |c: Color32| if offline && !have.contains(&t.id) { c.gamma_multiply(0.35) } else { c };
+                let (text, weak) = (fade(text), fade(weak));
+                let icon = if busy.contains(&t.id) { "…" } else if have.contains(&t.id) { OFFLINE_ICON } else { "" };
                 let clip = |c: Rect| ui.painter().with_clip_rect(c.intersect(ui.clip_rect()));
                 let font = FontId::proportional(14.0);
                 let dur = fmt(t.duration_ms as f64 / 1000.0);
@@ -277,6 +411,8 @@ impl App {
                     // filename on top; tags left, "duration · bpm" right underneath
                     let pad = row.shrink2(vec2(16.0, 6.0));
                     let (l1, l2) = pad.split_top_bottom_at_fraction(0.5);
+                    clip(l1).text(l1.left_center() + vec2(ICON / 2.0 - 2.0, 0.0), Align2::CENTER_CENTER, icon, FontId::proportional(13.0), text);
+                    let (l1, l2) = (l1.with_min_x(l1.left() + ICON), l2.with_min_x(l2.left() + ICON));
                     clip(l1).text(l1.left_center(), Align2::LEFT_CENTER, filename(t), font, text);
                     let meta = if t.bpm > 0 { format!("{dur} · {} · {}", t.bpm, ymd(t.added)) } else { format!("{dur} · {}", ymd(t.added)) };
                     let m = clip(l2).text(l2.right_center(), Align2::RIGHT_CENTER, meta, FontId::proportional(12.0), weak);
@@ -288,6 +424,7 @@ impl App {
                     let c = Rect::from_min_size(pos2(row.left() + x, row.top()), vec2(cw, row_h));
                     (c, clip(c))
                 };
+                clip(row).text(pos2(row.left() + 16.0 + ICON / 2.0 - 2.0, row.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(13.0), text);
                 let (c, p) = cell(0);
                 p.text(c.left_center(), Align2::LEFT_CENTER, filename(t), font.clone(), text);
                 let (c, p) = cell(1);
@@ -305,16 +442,31 @@ impl App {
         });
         let (clicked, vp) = out.inner;
         self.view = (vp.min.y, vp.height());
+        drop(busy); // toggle marks the track busy
+        if let Some(k) = hold {
+            self.off.toggle(list[k], self.note.clone());
+        }
         if let Some(k) = clicked {
-            self.player.borrow_mut().play(list.into_iter().cloned().collect(), k);
+            if !offline {
+                self.player.borrow_mut().play(list.into_iter().cloned().collect(), k);
+            } else if have.contains(&list[k].id) {
+                // offline: queue only what's on this device, so next/auto-advance never lands on a silent track
+                let queue: Vec<Track> = list.iter().filter(|t| have.contains(&t.id)).map(|t| (*t).clone()).collect();
+                let i = queue.iter().position(|t| t.id == list[k].id).unwrap();
+                self.player.borrow_mut().play(queue, i);
+            } else {
+                *self.note.borrow_mut() = Some("not on this device: hold a track (right-click on desktop) at home to download it".into());
+            }
         }
     }
 }
 
-/// Column (x, width) in a row `w` wide: filename 2fr, tags 1fr, duration 4em, bpm 3em, added 64px; 16px padding, 8px gaps.
+/// Column (x, width) in a row `w` wide, after the ICON column: filename 2fr, tags 1fr, duration 4em, bpm 3em,
+/// added 64px; 16px padding, 8px gaps.
 fn cols(w: f32) -> [(f32, f32); 5] {
-    let fr = ((w - 32.0 - 32.0 - 56.0 - 42.0 - 64.0) / 3.0).max(0.0);
-    [(16.0, 2.0 * fr), (24.0 + 2.0 * fr, fr), (32.0 + 3.0 * fr, 56.0), (96.0 + 3.0 * fr, 42.0), (146.0 + 3.0 * fr, 64.0)]
+    let fr = ((w - 32.0 - ICON - 32.0 - 56.0 - 42.0 - 64.0) / 3.0).max(0.0);
+    let x = 16.0 + ICON;
+    [(x, 2.0 * fr), (x + 8.0 + 2.0 * fr, fr), (x + 16.0 + 3.0 * fr, 56.0), (x + 80.0 + 3.0 * fr, 42.0), (x + 130.0 + 3.0 * fr, 64.0)]
 }
 
 /// Unix seconds as local yy/mm/dd.
@@ -352,8 +504,10 @@ fn controls(ui: &mut Ui, p: &mut Player, size: f32, min: Vec2) {
     if ui.add(b("⏭")).clicked() { p.next() }
 }
 
-/// Title — artist, and the waveform seek bar under it.
-fn now_playing(ui: &mut Ui, p: &mut Player) {
+/// Title — artist (with `time` right-aligned beside it, on phones), and the waveform seek bar under it.
+/// Returns whether the time was tapped.
+fn now_playing(ui: &mut Ui, p: &mut Player, time: Option<String>) -> bool {
+    let mut tapped = false;
     let mut job = LayoutJob::default();
     let font = FontId::proportional(14.0);
     match p.track() {
@@ -363,7 +517,19 @@ fn now_playing(ui: &mut Ui, p: &mut Player) {
         }
         None => job.append("nothing playing", 0.0, TextFormat::simple(font, ui.visuals().weak_text_color())),
     }
-    ui.add(Label::new(job).truncate());
+    let title = Label::new(job).truncate();
+    match time {
+        Some(time) => {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+            let t = ui.painter().text(r.right_center(), Align2::RIGHT_CENTER, time, FontId::proportional(14.0), ui.visuals().text_color());
+            tapped = ui.interact(t.expand(6.0), ui.id().with("time"), Sense::click()).clicked();
+            let left = Rect::from_min_max(r.min, pos2(t.left() - 8.0, r.max.y));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left).layout(Layout::left_to_right(Align::Center)), |ui| ui.add(title));
+        }
+        None => {
+            ui.add(title);
+        }
+    }
     let (pos, dur) = (p.pos(), p.dur());
     let seek = {
         let l = p.cur();
@@ -373,6 +539,40 @@ fn now_playing(ui: &mut Ui, p: &mut Player) {
     if let Some(f) = seek {
         p.seek(f as f64 * dur);
     }
+    tapped
+}
+
+/// Whether the share sheet takes files (canShare is missing on desktop Firefox; calling it there would throw).
+fn can_share() -> bool {
+    let nav = web_sys::window().unwrap().navigator();
+    if !js_sys::Reflect::has(&nav, &"canShare".into()).unwrap_or(false) {
+        return false;
+    }
+    let o = web_sys::FilePropertyBag::new();
+    o.set_type("audio/wav");
+    let Ok(f) = web_sys::File::new_with_u8_array_sequence_and_options(&js_sys::Array::of1(&js_sys::Uint8Array::new_with_length(44)), "probe.wav", &o) else { return false };
+    let d = web_sys::ShareData::new();
+    d.set_files(&js_sys::Array::of1(&f));
+    nav.can_share_with_data(&d)
+}
+
+/// Open the share sheet with `f`. Rejections: user cancelled (fine), or the tap's activation expired while
+/// preparing (the file is kept; the next tap shares it).
+fn share_now(f: web_sys::File, title: String, note: Rc<RefCell<Option<String>>>) {
+    let d = web_sys::ShareData::new();
+    d.set_files(&js_sys::Array::of1(&f));
+    d.set_title(&title);
+    let pr = web_sys::window().unwrap().navigator().share_with_data(&d);
+    spawn_local(async move {
+        if let Err(e) = JsFuture::from(pr).await {
+            let name = js_sys::Reflect::get(&e, &"name".into()).ok().and_then(|n| n.as_string()).unwrap_or_default();
+            if name == "NotAllowedError" {
+                *note.borrow_mut() = Some("ready — tap share again".into());
+            } else if name != "AbortError" {
+                *note.borrow_mut() = Some(format!("share failed: {name}"));
+            }
+        }
+    });
 }
 
 fn filename(t: &Track) -> &str {
@@ -385,10 +585,13 @@ fn wave(ui: &mut Ui, peaks: Option<&[f32]>, loaded: f32, progress: f32) -> Optio
     let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click_and_drag());
     if let Some(p) = peaks {
         let fg = ui.visuals().text_color();
-        let bw = rect.width() / p.len() as f32;
+        // at most one bar per 2 pt: a phone is ~360 pt wide, drawing all 1000 bins would stack them
+        let n = ((rect.width() / 2.0) as usize).clamp(1, p.len());
+        let bw = rect.width() / n as f32;
         let painter = ui.painter_at(rect);
-        for (b, &v) in p.iter().enumerate() {
-            let f = b as f32 / p.len() as f32;
+        for b in 0..n {
+            let v = p[b * p.len() / n..((b + 1) * p.len() / n).max(b * p.len() / n + 1)].iter().fold(0.0f32, |m, &x| m.max(x));
+            let f = b as f32 / n as f32;
             let c = if f < progress { pastel(330.0 - 150.0 * f) } else if f < loaded { pastel(330.0 - 150.0 * f).gamma_multiply(0.35) } else { fg.gamma_multiply(0.2) };
             let h = (v * rect.height()).max(1.0);
             painter.rect_filled(Rect::from_min_size(pos2(rect.left() + b as f32 * bw, rect.center().y - h / 2.0), vec2(bw, h)), 0.0, c);
@@ -400,26 +603,43 @@ fn wave(ui: &mut Ui, peaks: Option<&[f32]>, loaded: f32, progress: f32) -> Optio
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
-        if let Some((t, g)) = self.inbox.borrow_mut().take() {
+        let perf = web_sys::window().unwrap().performance().unwrap();
+        let t0 = perf.now();
+        let loaded = self.inbox.borrow_mut().take();
+        if let Some((t, g)) = loaded {
             (self.tracks, self.tags) = (t, g);
-            if self.tags.color_missing(js_sys::Math::random) {
-                self.save_tags(); // tags from before colors existed (or made in the old UI) get theirs once
-            }
+            self.gen += 1;
+            let pending = self.off.pending.clone(); // edits not yet on the server: keep showing them
+            pending.iter().for_each(|op| self.tags.apply(op));
+            self.color_new_tags();
+            self.off.flush();
+        }
+        if let Some(doc) = self.off.take_synced() {
+            self.tags = doc; // the server's doc also carries other devices' edits
+            self.gen += 1;
         }
         ui.ctx().request_repaint_after(Duration::from_millis(250)); // clock + waveform progress
         let now = ui.input(|i| i.time);
+        if !self.off.pending.is_empty() && now - self.last_flush > 15.0 {
+            self.last_flush = now; // retry queued tag edits while the Pi is out of reach
+            self.off.flush();
+        }
         if let Some((id, r)) = self.analyzed.borrow_mut().take() {
             let name = self.tracks.iter().find(|t| t.id == id).map_or(String::new(), |t| filename(t).to_owned());
             self.status = Some((
                 match r {
                     Ok(bpm) => {
                         self.tracks.iter_mut().filter(|t| t.id == id).for_each(|t| t.bpm = bpm);
+                        self.gen += 1;
                         format!("{bpm} BPM written to {name}")
                     }
                     Err(e) => format!("analyze failed: {e}"),
                 },
                 now + 5.0,
             ));
+        }
+        if let Some(msg) = self.note.borrow_mut().take() {
+            self.status = (!msg.is_empty()).then_some((msg, now + 5.0));
         }
         if self.status.as_ref().is_some_and(|(_, until)| now > *until) {
             self.status = None;
@@ -436,15 +656,39 @@ impl eframe::App for App {
             let h = if ui.available_width() < NARROW { 36.0 } else { 0.0 }; // thumb-sized on phones
             ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
             ui.collapsing("tags", |ui| self.tags_panel(ui));
+            if self.off.unreachable.get() {
+                let n = self.off.pending.len();
+                let queued = if n > 0 { format!(" · {n} tag change{} waiting to sync", if n == 1 { "" } else { "s" }) } else { String::new() };
+                ui.weak(format!("offline: playing downloaded tracks{queued}"));
+            }
+            let offer = self.install.borrow().clone();
+            if let Some(e) = offer {
+                if ui.button("install app").clicked() {
+                    if let Ok(f) = js_sys::Reflect::get(&e, &"prompt".into()).and_then(|f| f.dyn_into::<js_sys::Function>()) {
+                        let _ = f.call0(&e); // inside the click: egui runs click logic in the pointer event
+                    }
+                    *self.install.borrow_mut() = None;
+                }
+            }
         });
         egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
         egui::CentralPanel::default().show(ui, |ui| self.list(ui));
+        if let Some((dt, cpu)) = &mut self.fps {
+            // smoothed over ~20 frames; repaint continuously so the number is the real frame rate
+            *dt += (ui.input(|i| i.unstable_dt) as f64 * 1000.0 - *dt) * 0.05;
+            *cpu += (perf.now() - t0 - *cpu) * 0.05;
+            let msg = format!("{:.0} fps · {:.1} ms frame · {:.1} ms ui", 1000.0 / dt.max(0.001), dt, cpu);
+            egui::Area::new("fps".into()).anchor(Align2::RIGHT_TOP, vec2(-8.0, 8.0)).show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.add(Label::new(RichText::new(msg).monospace()).wrap_mode(egui::TextWrapMode::Extend)));
+            });
+            ui.ctx().request_repaint();
+        }
         if self.help {
             let m = egui::Modal::new("help".into()).show(ui.ctx(), |ui| {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "? — this help"] {
+                          "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");

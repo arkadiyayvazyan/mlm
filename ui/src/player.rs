@@ -18,7 +18,7 @@ use web_sys::{
 use crate::pcm::{self, BINS};
 use crate::Track;
 
-const CAP: usize = 1 << 18; // ring frames, ~6 s at 44.1 kHz: rides out background-tab timer throttling (1 tick/s)
+const CAP: usize = 1 << 20; // ring frames, ~24 s at 44.1 kHz: rides out background-tab timer throttling (1 tick/s) and app-switch stalls
 const CHUNK: usize = 8192; // frames converted per ring write
 // ponytail: PCM kept whole in memory (~10 MB/min at 16-bit/44.1k stereo); window of cur + 2. Range-fetch on seek if phones choke
 const PRELOAD: usize = 2; // tracks fetched ahead of the playing one
@@ -39,9 +39,26 @@ impl Loaded {
     pub fn dur(&self) -> f64 {
         if self.rate > 0 { self.frames as f64 / self.rate as f64 } else { 0.0 }
     }
+    /// The whole track as a WAV file once fully loaded (to share an AIFF, which Android's share sheet won't take).
+    pub fn wav(&self) -> Option<Vec<u8>> {
+        let len = self.loaded * self.nch * self.bps;
+        (self.done && self.rate > 0).then(|| [&pcm::wav_header(self.rate, self.nch, self.bps, self.loaded)[..], &self.bytes[..len]].concat())
+    }
     fn append(&mut self, chunk: &[u8]) {
-        let from = self.loaded;
         self.bytes.extend_from_slice(chunk);
+        self.grew();
+    }
+    /// A network chunk, copied straight from JS into `bytes`: the one copy of a track's ~70 MB this makes.
+    fn append_js(&mut self, chunk: &Uint8Array) {
+        let (len, n) = (self.bytes.len(), chunk.length() as usize);
+        self.bytes.reserve(n);
+        chunk.copy_to_uninit(&mut self.bytes.spare_capacity_mut()[..n]);
+        // SAFETY: copy_to_uninit initialized exactly these n bytes
+        unsafe { self.bytes.set_len(len + n) };
+        self.grew();
+    }
+    fn grew(&mut self) {
+        let from = self.loaded;
         self.loaded = (self.bytes.len() / (self.bps * self.nch)).min(self.frames);
         pcm::update_peaks(&mut self.peaks, &self.bytes, self.bps, self.nch, from, self.loaded, self.frames);
     }
@@ -172,6 +189,11 @@ impl Player {
             let _ = if c.state() == AudioContextState::Running { c.suspend() } else { c.resume() };
         }
     }
+    pub fn set_playing(&self, on: bool) {
+        if let Some(c) = &self.ctx {
+            let _ = if on { c.resume() } else { c.suspend() };
+        }
+    }
     pub fn download(&self) {
         let Some(t) = self.track() else { return };
         let doc = web_sys::window().unwrap().document().unwrap();
@@ -200,7 +222,8 @@ impl Player {
             let tr = &self.queue[q];
             let mut s = match old.iter().position(|s| s.id == tr.id) {
                 Some(k) => old.swap_remove(k),
-                None => open(tr),
+                None if q == i => open(tr),
+                None => continue, // preloads start once this track is in: see tick
             };
             s.q = q;
             self.slots.push(s);
@@ -216,10 +239,31 @@ impl Player {
         self.tick();
     }
 
+    /// ponytail: temporary dropout probe, reports to the Pi's journal via /api/log; delete once the app-switch gap is understood
+    pub fn probe(&self, last: &mut Option<(f64, i32, i32, bool)>) {
+        let (Some(ring), Some(ctx)) = (&self.ring, &self.ctx) else { return };
+        let (now, r, rate) = (js_sys::Date::now(), ring.read(), ctx.sample_rate() as f64);
+        let buf = ring.w.wrapping_sub(r);
+        let hidden = web_sys::window().unwrap().document().unwrap().hidden();
+        let log = |m: String| web_sys::window().unwrap().navigator().send_beacon_with_opt_str("/api/log", Some(&m));
+        if let Some((t, r0, b0, h0)) = *last {
+            let (dt, played) = ((now - t) / 1000.0, r.wrapping_sub(r0) as f64 / rate);
+            if hidden != h0 {
+                let _ = log(format!("hidden {hidden}, buffered {:.2}s, ctx {:?}", buf as f64 / rate, ctx.state()));
+            }
+            if self.playing() && dt - played > 0.15 {
+                let _ = log(format!("stall {:.2}s of {dt:.2}s, buffered {:.2}s -> {:.2}s, hidden {hidden}, ctx {:?}",
+                    dt - played, b0 as f64 / rate, buf as f64 / rate, ctx.state()));
+            }
+        }
+        *last = Some((now, r, buf, hidden));
+    }
+
     /// Called every 50 ms: top the ring up, track what the worklet has played, keep the preload window.
     pub fn tick(&mut self) {
         let (Some(ring), Some(ctx)) = (&mut self.ring, self.ctx.clone()) else { return };
-        let mut free = CAP - ring.w.wrapping_sub(ring.read()) as usize;
+        // at most ~1 s of audio converted per 50 ms tick: filling the whole ring at once stalls a phone's UI
+        let mut free = (CAP - ring.w.wrapping_sub(ring.read()) as usize).min(CHUNK * 6);
         let mut out = Vec::with_capacity(CHUNK * 2);
         let mut rate_change = false;
         while free > 0 {
@@ -259,6 +303,11 @@ impl Player {
         }
         let Some(q) = self.segs.front().map(|s| s.q) else { return };
         self.slots.retain(|s| s.q >= q);
+        // the playing track streams alone (full bandwidth, and on a phone the main thread isn't copying three
+        // tracks at once); the preloads follow once it's all in, seconds later and long before it ends
+        if !self.slot(q).is_some_and(|s| s.l.borrow().done) {
+            return;
+        }
         for k in q..(q + 1 + PRELOAD).min(self.queue.len()) {
             if self.slot(k).is_none() {
                 let s = open(&self.queue[k]);
@@ -328,13 +377,14 @@ async fn stream_wav(url: &str, signal: &AbortSignal, l: &RefCell<Loaded>) -> Res
         if Reflect::get(&r, &"done".into())?.is_truthy() {
             return Ok(());
         }
-        let chunk = Uint8Array::new(&Reflect::get(&r, &"value".into())?).to_vec();
+        // already a Uint8Array: `Uint8Array::new` on it would copy the whole chunk, `to_vec` a second time
+        let chunk: Uint8Array = Reflect::get(&r, &"value".into())?.unchecked_into();
         let mut l = l.borrow_mut();
         if l.rate > 0 {
-            l.append(&chunk);
+            l.append_js(&chunk);
             continue;
         }
-        head.extend(chunk);
+        head.extend(chunk.to_vec());
         if head.len() < 44 {
             continue;
         }

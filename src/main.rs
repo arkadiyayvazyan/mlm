@@ -2,8 +2,10 @@ mod aiff;
 mod bpm;
 mod decode;
 mod library;
+#[path = "../ui/src/tags.rs"]
+#[allow(dead_code)] // shared with the UI; the server only needs Tags + Op::apply
+mod tags;
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -27,6 +29,7 @@ struct App {
     dir: PathBuf,
     cache: PathBuf,
     tags: PathBuf,
+    tags_lock: Arc<std::sync::Mutex<()>>, // serializes read-apply-write of the tags file
 }
 
 impl App {
@@ -50,6 +53,7 @@ async fn main() {
         cache: PathBuf::from(env("MLM_CACHE", "mlm-index.json")),
         tags: PathBuf::from(env("MLM_TAGS", "mlm-tags.json")),
         tracks: Default::default(),
+        tags_lock: Default::default(),
     };
     *app.tracks.write().unwrap() = Arc::new(library::load_cache(&app.dir, &app.cache));
     app.rescan();
@@ -62,12 +66,19 @@ async fn main() {
         .route("/manifest.json", get(|| async { ([(header::CONTENT_TYPE, "application/manifest+json")], include_bytes!("../ui/manifest.json").as_slice()) }))
         .route("/icon-192.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../ui/icon-192.png").as_slice()) }))
         .route("/icon-512.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../ui/icon-512.png").as_slice()) }))
+        .route("/icon-mono.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../ui/icon-mono.png").as_slice()) }))
+        .route("/silence.wav", get(silence))
+        .route("/sw.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")], include_bytes!("../ui/sw.js").as_slice()) }))
         .route("/worklet.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("../ui/worklet.js").as_slice()) }))
         .route("/api/tracks", get(tracks))
         .route("/api/tracks/{id}/file", get(file))
         .route("/api/tracks/{id}/pcm", get(pcm))
         .route("/api/tracks/{id}/analyze", post(analyze))
-        .route("/api/tags", get(tags_get).put(tags_put))
+        .route("/api/tracks/{id}/art", get(art))
+        .route("/api/tags", get(tags_get))
+        .route("/api/tags/ops", post(tags_ops))
+        // ponytail: temporary, the UI's dropout probe logs here (journalctl -u mlm)
+        .route("/api/log", post(|body: String| async move { eprintln!("client: {body}"); StatusCode::NO_CONTENT }))
         .route("/api/rescan", post(|State(app): State<App>| async move { app.rescan(); StatusCode::ACCEPTED }))
         .with_state(app);
 
@@ -82,29 +93,25 @@ async fn tracks(State(app): State<App>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-/// User tags: `{ keys: { name: key }, tracks: { rel_path: [name] } }`. The client owns the document;
-/// the server only validates the shape and stores it.
-#[derive(serde::Deserialize)]
-#[allow(dead_code)]
-struct Tags {
-    keys: BTreeMap<String, String>,
-    tracks: BTreeMap<String, Vec<String>>,
-}
-
 async fn tags_get(State(app): State<App>) -> Response {
     let body = std::fs::read(&app.tags).unwrap_or_else(|_| br#"{"keys":{},"tracks":{}}"#.to_vec());
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-// ponytail: whole-doc PUT, last write wins across devices; per-track POST if two clients tag at once
-async fn tags_put(State(app): State<App>, body: Bytes) -> StatusCode {
-    if serde_json::from_slice::<Tags>(&body).is_err() {
-        return StatusCode::BAD_REQUEST;
-    }
+/// Apply a batch of tag edits (`[{"op": "tag", ...}]`, see `tags::Op`) to the stored doc and return the result.
+/// Clients send per-change ops, queued while offline, instead of whole documents: nobody overwrites anybody.
+async fn tags_ops(State(app): State<App>, body: Bytes) -> Response {
+    let Ok(ops) = serde_json::from_slice::<Vec<tags::Op>>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let _g = app.tags_lock.lock().unwrap();
+    let mut doc: tags::Tags = std::fs::read(&app.tags).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    ops.iter().for_each(|op| doc.apply(op));
+    let body = serde_json::to_vec(&doc).unwrap();
     let tmp = app.tags.with_extension("tmp"); // write + rename: a crash mid-write can't truncate user data
     match std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &app.tags)) {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(()) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -127,6 +134,35 @@ async fn pcm(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Respo
     }
     let body = Body::from_stream(decode::stream(t.path.clone(), t.duration_ms));
     ([(header::CONTENT_TYPE, "audio/wav")], body).into_response()
+}
+
+/// 10 s of silence the UI loops in an <audio> element while playing: Chrome on Android only shows the lock-screen
+/// player (and iOS only keeps audio alive when locked) while a media element plays; Web Audio alone doesn't count.
+async fn silence() -> impl IntoResponse {
+    let data_len = 8000 * 2 * 10;
+    let mut b = aiff::Info { channels: 1, bits: 16, rate: 8000, data_off: 0, data_len, little: true }.wav_header().to_vec();
+    b.resize(b.len() + data_len as usize, 0);
+    ([(header::CONTENT_TYPE, "audio/wav")], b)
+}
+
+/// Embedded cover art (front cover, else the first picture) for the lock screen; the app icon when there is none,
+/// so the artwork URL the UI hands to the Media Session is always a valid image.
+async fn art(State(app): State<App>, Path(id): Path<u64>) -> Response {
+    let Some(path) = app.tracks().iter().find(|t| t.id == id).map(|t| t.path.clone()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let pic = tokio::task::spawn_blocking(move || {
+        use lofty::file::TaggedFileExt;
+        let f = lofty::read_from_path(&path).ok()?;
+        let tag = f.primary_tag().or_else(|| f.first_tag())?;
+        let pics = tag.pictures();
+        let p = pics.iter().find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront).or(pics.first())?;
+        Some((p.data().to_vec(), p.mime_type().map_or("image/jpeg", |m| m.as_str()).to_owned()))
+    })
+    .await
+    .unwrap();
+    let (body, mime) = pic.unwrap_or_else(|| (include_bytes!("../ui/icon-512.png").to_vec(), "image/png".into()));
+    ([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "max-age=86400".into())], body).into_response()
 }
 
 /// Detect the tempo, write it to the file's BPM tag, re-index. `{"bpm": 124}`, or 422 when no tempo is found.

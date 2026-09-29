@@ -13,6 +13,30 @@ written back untouched), `tmpo` via lofty for M4A. The file is edited in place s
 a `.name.mlm-bak` copy exists only during the write. On 40 library tracks it matched the existing tag in 35.
 Ctrl+D downloads the playing track; `?` lists all keys.
 
+## Phones: lock screen, background, share
+
+The Media Session API (`ui/src/media.rs`) drives the Android notification / lock-screen player and headphone,
+Bluetooth, car and watch controls: title, artist, album, cover art (`GET /api/tracks/{id}/art`, the app icon when
+a file has none), play/pause, previous/next, ±30 s, and a draggable progress bar. Chrome only shows it (and iOS
+only keeps audio running when locked) while a media element plays, so a looping silent `/silence.wav` plays along
+with the Web Audio output; on iOS 17.5+ `navigator.audioSession.type = "playback"` keeps Web Audio alive too.
+On phones the player bar has ⬇ / bpm / share buttons. Share sends the original file for MP3/M4A/WAV/FLAC/Ogg;
+Android's share sheet refuses AIFF, so AIFF goes as a lossless WAV built from the already-loaded audio (no tags).
+The manifest has a monochrome icon for Android 13+ themed icons; when Chrome offers installation, an
+"install app" button appears under the search box.
+
+## Offline
+
+Hold a track (right-click on desktop) to keep it on the device; again to remove it. A 💾 in the first column marks
+downloaded tracks. The copy is the track's `/pcm` stream plus cover art in Cache Storage, and `ui/sw.js` (a service
+worker) plays it from there; the app itself, the track list and the tags are cached by `sw.js` too (network first,
+4 s, else the last copy), so the installed app opens and plays downloaded tracks anywhere. Away from the Pi the
+other tracks are faded and the queue only holds downloaded ones.
+
+Tag edits are ops (`tags::Op`, `ui/src/tags.rs`, shared with the server): applied at once, queued in localStorage,
+and sent to `POST /api/tags/ops` whenever the Pi answers (retried every 15 s). The server applies them to its doc,
+so offline phones and stale tabs never overwrite each other's edits.
+
 ## HTTPS
 
 SharedArrayBuffer and AudioWorklet need a secure, cross-origin isolated page: the server sends the
