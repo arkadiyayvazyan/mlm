@@ -1,0 +1,3 @@
+# web-sys marks the Media Session API (lock-screen player, ui/src/media.rs) as unstable
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

@@ -4,6 +4,10 @@ mod tags;
 #[cfg(target_arch = "wasm32")]
 mod app;
 #[cfg(target_arch = "wasm32")]
+mod media;
+#[cfg(target_arch = "wasm32")]
+mod offline;
+#[cfg(target_arch = "wasm32")]
 mod player;
 
 #[derive(serde::Deserialize, Clone)]
