@@ -293,8 +293,8 @@ impl App {
             for n in self.tags.keys.keys().cloned().collect::<Vec<_>>() {
                 let on = self.tags.has(&rel, &n);
                 let stroke = if on { egui::Stroke::new(3.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
-                let fill = if on { tag_color(&self.tags, &n) } else { tag_color(&self.tags, &n).gamma_multiply(0.45) };
-                let b = Button::new(RichText::new(&n).size(18.0).color(INK)).fill(fill).stroke(stroke).min_size(vec2(w, 52.0));
+                let label = if on { format!("✔ {n}") } else { n.clone() }; // always full pastel: faded fills read as disabled
+                let b = Button::new(RichText::new(label).size(18.0).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke).min_size(vec2(w, 52.0));
                 if ui.add(b).clicked() {
                     self.edit(Op::Tag { on: !on, rel: rel.clone(), name: n });
                 }
