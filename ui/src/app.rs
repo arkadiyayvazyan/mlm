@@ -18,7 +18,6 @@ use crate::{fmt, Track};
 const ROW: f32 = 26.0;
 const NARROW: f32 = 600.0; // below this width (phones): two-line rows, touch-sized controls
 const ICON: f32 = 20.0; // the offline-copy column before the filename
-const OFFLINE_ICON: &str = "⬇"; // same arrow as the download button
 
 pub struct App {
     tracks: Vec<Track>,
@@ -44,10 +43,12 @@ pub struct App {
     gen: u64,        // bumped whenever tracks or tags change: the filtered + sorted list is rebuilt only then
     bpm: (u32, u32), // BPM filter: center, ± range; kept while off so the closing row still shows them
     bpm_on: bool,    // hold the bpm column to turn on
+    offline_only: bool, // tap the offline column: only tracks with a copy on this device
     tags_open: bool,
     search_open: bool,
     focus_search: bool, // the search field takes focus once it's drawn
-    list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, u64), // (query, sort, bpm, gen) the cached list was built for
+    // (query, sort, bpm, offline copies when filtering on them, gen) the cached list was built for
+    list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, Option<usize>, u64),
     list_idx: Vec<usize>, // that list, as indices into `tracks`
     fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
 }
@@ -104,7 +105,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, tags_open: false, search_open: false, focus_search: false, list_key: (String::new(), None, None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, tags_open: false, search_open: false, focus_search: false, list_key: (String::new(), None, None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -346,16 +347,20 @@ impl App {
             self.header(ui, false); // phones: in the bottom panel, under the thumb
         }
         // filter + sort only when the query, sort, BPM filter or data changed: every frame costs too much on a phone
-        let key = (self.q.clone(), self.sort, self.bpm_on.then_some(self.bpm), self.gen);
+        // ponytail: offline copies keyed by count, a swap of one copy for another in one frame goes unseen
+        let key = (self.q.clone(), self.sort, self.bpm_on.then_some(self.bpm), self.offline_only.then(|| self.off.have.borrow().len()), self.gen);
         if key != self.list_key {
             let q = self.q.trim().to_lowercase();
+            let have = self.off.have.borrow();
             let mut idx: Vec<usize> = (0..self.tracks.len())
                 .filter(|&i| {
                     let t = &self.tracks[i];
                     self.bpm_on.then_some(self.bpm).is_none_or(|(c, r)| t.bpm > 0 && t.bpm.abs_diff(c) <= r)
+                        && (!self.offline_only || have.contains(&t.id))
                         && (q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q))
                 })
                 .collect();
+            drop(have);
             let tr = &self.tracks;
             if let Some((c, desc)) = self.sort {
                 match c {
@@ -409,7 +414,11 @@ impl App {
                 // Pi out of reach: tracks without an offline copy can't play, show them faded
                 let fade = |c: Color32| if offline && !have.contains(&t.id) { c.gamma_multiply(0.35) } else { c };
                 let (text, weak) = (fade(text), fade(weak));
-                let icon = if busy.contains(&t.id) { "…" } else if have.contains(&t.id) { OFFLINE_ICON } else { "" };
+                let icon = |p: &Painter, at: egui::Pos2| if busy.contains(&t.id) {
+                    p.text(at, Align2::CENTER_CENTER, "…", FontId::proportional(13.0), text);
+                } else if have.contains(&t.id) {
+                    tray(p, at, text);
+                };
                 let clip = |c: Rect| ui.painter().with_clip_rect(c.intersect(ui.clip_rect()));
                 let font = FontId::proportional(14.0);
                 let dur = fmt(t.duration_ms as f64 / 1000.0);
@@ -418,7 +427,7 @@ impl App {
                     // filename on top; tags left, "duration · bpm" right underneath
                     let pad = row.shrink2(vec2(16.0, 6.0));
                     let (l1, l2) = pad.split_top_bottom_at_fraction(0.5);
-                    clip(l1).text(l1.left_center() + vec2(ICON / 2.0 - 2.0, 0.0), Align2::CENTER_CENTER, icon, FontId::proportional(13.0), text);
+                    icon(&clip(l1), l1.left_center() + vec2(ICON / 2.0 - 2.0, 0.0));
                     let (l1, l2) = (l1.with_min_x(l1.left() + ICON), l2.with_min_x(l2.left() + ICON));
                     clip(l1).text(l1.left_center(), Align2::LEFT_CENTER, filename(t), font, text);
                     let meta = if t.bpm > 0 { format!("{dur} · {} · {}", t.bpm, ymd(t.added)) } else { format!("{dur} · {}", ymd(t.added)) };
@@ -431,7 +440,7 @@ impl App {
                     let c = Rect::from_min_size(pos2(row.left() + x, row.top()), vec2(cw, row_h));
                     (c, clip(c))
                 };
-                clip(row).text(pos2(row.left() + 16.0 + ICON / 2.0 - 2.0, row.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(13.0), text);
+                icon(&clip(row), pos2(row.left() + 16.0 + ICON / 2.0 - 2.0, row.center().y));
                 let (c, p) = cell(0);
                 p.text(c.left_center(), Align2::LEFT_CENTER, filename(t), font.clone(), text);
                 let (c, p) = cell(1);
@@ -499,6 +508,15 @@ impl App {
         let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color());
         // desktop: painted over the list's columns; phones: flat buttons, as wide as their text, 40 pt tall
         let hdr = (!narrow).then(|| ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::hover()).0);
+        let r = match hdr {
+            None => ui.add(Button::new("").frame(false).min_size(vec2(28.0, 40.0))),
+            Some(hdr) => ui.interact(Rect::from_min_size(pos2(hdr.left() + 14.0, hdr.top()), vec2(ICON, ROW)), ui.id().with("offline_only"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand),
+        };
+        tray(ui.painter(), r.rect.center(), if self.offline_only || r.hovered() { text } else { weak });
+        if r.on_hover_text("only tracks on this device").clicked() {
+            self.offline_only = !self.offline_only;
+        }
         for i in 0..5 {
             let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
             let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
@@ -567,6 +585,15 @@ fn chips(p: &Painter, all: &Tags, tags: &[String], mut x: f32, y: f32) {
         p.galley(r.min + vec2(7.0, 2.0), g, INK);
         x = r.right() + 4.0;
     }
+}
+
+/// Offline copy: a down arrow into a tray, 12 pt, centered on `at`.
+fn tray(p: &Painter, at: egui::Pos2, c: Color32) {
+    let s = egui::Stroke::new(1.5, c);
+    let v = |x: f32, y: f32| at + vec2(x, y);
+    p.line_segment([v(0.0, -6.0), v(0.0, 2.0)], s);
+    p.line(vec![v(-3.5, -1.5), v(0.0, 2.0), v(3.5, -1.5)], s);
+    p.line(vec![v(-6.0, 1.0), v(-6.0, 6.0), v(6.0, 6.0), v(6.0, 1.0)], s);
 }
 
 /// Three waveform bars (short, tall, medium), like the app icon, centered on a button.
