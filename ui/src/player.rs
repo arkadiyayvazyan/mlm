@@ -8,17 +8,17 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use js_sys::{Atomics, Float32Array, Int32Array, Object, Reflect, SharedArrayBuffer, Uint8Array};
-use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     AbortController, AbortSignal, AudioContext, AudioContextOptions, AudioContextState, AudioWorkletNode,
-    AudioWorkletNodeOptions, HtmlAnchorElement, HtmlAudioElement, ReadableStreamDefaultReader, RequestInit, Response,
+    AudioWorkletNodeOptions, HtmlAnchorElement, ReadableStreamDefaultReader, RequestInit, Response,
 };
 
 use crate::pcm::{self, BINS};
 use crate::Track;
 
-const CAP: usize = 1 << 20; // ring frames, ~24 s at 44.1 kHz: rides out background-tab timer throttling (1 tick/s) and app-switch stalls
+const CAP: usize = 1 << 18; // ring frames, ~6 s at 44.1 kHz: rides out background-tab timer throttling (1 tick/s)
 const CHUNK: usize = 8192; // frames converted per ring write
 // ponytail: PCM kept whole in memory (~10 MB/min at 16-bit/44.1k stereo); window of cur + 2. Range-fetch on seek if phones choke
 const PRELOAD: usize = 2; // tracks fetched ahead of the playing one
@@ -110,9 +110,6 @@ pub struct Player {
     pub queue: Vec<Track>,
     ring: Option<Ring>, // None: page isn't cross-origin isolated, no SharedArrayBuffer
     ctx: Option<AudioContext>,
-    // what's heard: the ctx's output as a MediaStream in a media element, not ctx.destination. Chrome on Android
-    // drops ~1 s of a Web Audio page's direct output when the app goes to the background; media playback rides it out
-    out: HtmlAudioElement,
     slots: Vec<Slot>, // the playing track and PRELOAD after it
     segs: VecDeque<Seg>, // what's in the ring, oldest first; segs[0] is playing
     fill: (usize, usize), // producer position: queue index, next track frame to write
@@ -127,14 +124,7 @@ impl Player {
             let d = Float32Array::new_with_byte_offset(&sab, 16);
             Ring { sab, h, d, w: 0 }
         });
-        let out = HtmlAudioElement::new().unwrap();
-        // ponytail: temporary probe
-        let ev = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| beacon(&format!("out {}", e.type_())));
-        for t in ["pause", "playing", "waiting", "stalled", "emptied"] {
-            let _ = out.add_event_listener_with_callback(t, ev.as_ref().unchecked_ref());
-        }
-        ev.forget();
-        Self { queue: vec![], ring, ctx: None, out, slots: vec![], segs: VecDeque::new(), fill: (0, 0) }
+        Self { queue: vec![], ring, ctx: None, slots: vec![], segs: VecDeque::new(), fill: (0, 0) }
     }
 
     pub fn supported(&self) -> bool {
@@ -224,9 +214,7 @@ impl Player {
         if let Some(c) = self.ctx.take_if(|c| rate > 0 && c.sample_rate() as u32 != rate) {
             let _ = c.close();
         }
-        let out = self.out.clone();
-        let ctx = self.ctx.get_or_insert_with(|| new_ctx(rate, &sab, &out)).clone();
-        let _ = out.play(); // from the tap that started playback: satisfies autoplay rules
+        let ctx = self.ctx.get_or_insert_with(|| new_ctx(rate, &sab)).clone();
         if ctx.state() == AudioContextState::Suspended {
             let _ = ctx.resume();
         }
@@ -251,34 +239,9 @@ impl Player {
         self.tick();
     }
 
-    /// ponytail: temporary dropout probe, reports to the Pi's journal via /api/log; delete once the app-switch gap is understood
-    pub fn probe(&self, last: &mut Option<(f64, i32, i32, bool)>) {
-        let (Some(ring), Some(ctx)) = (&self.ring, &self.ctx) else { return };
-        let (now, r, rate) = (js_sys::Date::now(), ring.read(), ctx.sample_rate() as f64);
-        let buf = ring.w.wrapping_sub(r);
-        let hidden = web_sys::window().unwrap().document().unwrap().hidden();
-        let log = |m: String| beacon(&m);
-        if let Some((t, r0, b0, h0)) = *last {
-            let (dt, played) = ((now - t) / 1000.0, r.wrapping_sub(r0) as f64 / rate);
-            if hidden != h0 {
-                let _ = log(format!("hidden {hidden}, buffered {:.2}s, ctx {:?}", buf as f64 / rate, ctx.state()));
-            }
-            if self.playing() && dt - played > 0.15 {
-                let _ = log(format!("stall {:.2}s of {dt:.2}s, buffered {:.2}s -> {:.2}s, hidden {hidden}, ctx {:?}",
-                    dt - played, b0 as f64 / rate, buf as f64 / rate, ctx.state()));
-            }
-        }
-        *last = Some((now, r, buf, hidden));
-    }
-
     /// Called every 50 ms: top the ring up, track what the worklet has played, keep the preload window.
     pub fn tick(&mut self) {
         let (Some(ring), Some(ctx)) = (&mut self.ring, self.ctx.clone()) else { return };
-        // the element follows the ctx: paused with it, and replayed if the browser paused it (audio focus, new srcObject)
-        let running = ctx.state() == AudioContextState::Running;
-        if self.out.paused() == running {
-            let _ = if running { self.out.play().map(drop) } else { self.out.pause() };
-        }
         // at most ~1 s of audio converted per 50 ms tick: filling the whole ring at once stalls a phone's UI
         let mut free = (CAP - ring.w.wrapping_sub(ring.read()) as usize).min(CHUNK * 6);
         let mut out = Vec::with_capacity(CHUNK * 2);
@@ -337,24 +300,12 @@ impl Player {
     }
 }
 
-/// ponytail: temporary, the dropout probe's line to the Pi's journal
-pub fn beacon(m: &str) {
-    let _ = web_sys::window().unwrap().navigator().send_beacon_with_opt_str("/api/log", Some(m));
-}
-
-fn new_ctx(rate: u32, sab: &SharedArrayBuffer, out: &HtmlAudioElement) -> AudioContext {
+fn new_ctx(rate: u32, sab: &SharedArrayBuffer) -> AudioContext {
     let o = AudioContextOptions::new();
     if rate > 0 {
         o.set_sample_rate(rate as f32);
     }
-    // no output device of its own (Chrome 110+; ignored elsewhere): `out` is the only stream, and a Web Audio
-    // stream on Bluetooth is what Chrome on Android stutters when the app goes to the background
-    let none = Object::new();
-    let _ = Reflect::set(&none, &"type".into(), &"none".into());
-    let _ = Reflect::set(&o, &"sinkId".into(), &none);
     let ctx = AudioContext::new_with_context_options(&o).unwrap();
-    let dest = ctx.create_media_stream_destination().unwrap();
-    out.set_src_object(Some(&dest.stream()));
     let (c, sab) = (ctx.clone(), sab.clone());
     spawn_local(async move {
         let r: Result<(), JsValue> = async {
@@ -364,18 +315,7 @@ fn new_ctx(rate: u32, sab: &SharedArrayBuffer, out: &HtmlAudioElement) -> AudioC
             Reflect::set(&p, &"sab".into(), &sab)?;
             o.set_processor_options(Some(&p));
             o.set_output_channel_count(&js_sys::Array::of1(&2.into()));
-            let node = AudioWorkletNode::new_with_options(&c, "ring", &o)?;
-            node.connect_with_audio_node(&dest)?;
-            // ponytail: temporary probe, worklet.js posts gaps between its callbacks; ctx state changes
-            let gap = Closure::<dyn Fn(JsValue)>::new(|e: JsValue| {
-                beacon(&format!("worklet {}", Reflect::get(&e, &"data".into()).unwrap_or_default().as_string().unwrap_or_default()))
-            });
-            Reflect::set(&Reflect::get(&node, &"port".into())?, &"onmessage".into(), gap.as_ref())?;
-            gap.forget();
-            let c2 = c.clone();
-            let state = Closure::<dyn Fn()>::new(move || beacon(&format!("ctx {:?}", c2.state())));
-            c.set_onstatechange(Some(state.as_ref().unchecked_ref()));
-            state.forget();
+            AudioWorkletNode::new_with_options(&c, "ring", &o)?.connect_with_audio_node(&c.destination())?;
             Ok(())
         }
         .await;

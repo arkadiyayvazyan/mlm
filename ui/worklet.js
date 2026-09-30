@@ -17,14 +17,6 @@ class Ring extends AudioWorkletProcessor {
     const r = Atomics.load(h, 1), n = Math.min(L.length, (Atomics.load(h, 0) - r) | 0);   // underrun: rest stays silent
     for (let i = 0; i < n; i++) { const k = ((r + i) & this.mask) * 2; L[i] = this.d[k]; R[i] = this.d[k + 1]; }
     Atomics.store(h, 1, (r + n) | 0);
-    // temporary probe (player.rs beacon): wall-clock gap between callbacks, then how many callbacks the burst after it took
-    const now = Date.now();
-    if (this.t && now - this.t > 150) { this.gap = now - this.t; this.burst = 0; this.at = now; }
-    if (this.gap && (this.burst++, now - this.at > 500)) {
-      this.port.postMessage(`gap ${this.gap}ms, then ${this.burst} callbacks (${(this.burst * 128 / sampleRate).toFixed(2)}s of audio) in ${now - this.at}ms`);
-      this.gap = 0;
-    }
-    this.t = now;
     return true;
   }
 }
