@@ -320,9 +320,12 @@ impl Player {
         }
         let Some(q) = self.segs.front().map(|s| s.q) else { return };
         self.slots.retain(|s| s.q >= q);
-        // the playing track streams alone (full bandwidth, and on a phone the main thread isn't copying three
-        // tracks at once); the preloads follow once it's all in, seconds later and long before it ends
-        if !self.slot(q).is_some_and(|s| s.l.borrow().done) {
+        // the playing track streams alone until it's all in or LEAD s past the ring's write point (full bandwidth
+        // for its start, and on a phone the main thread isn't copying three tracks at once); waiting for all of it
+        // left next/skip with nothing preloaded for the first ~half minute of every track
+        const LEAD: usize = 30;
+        let fill = self.fill.1;
+        if !self.slot(q).is_some_and(|s| { let l = s.l.borrow(); l.done || l.loaded >= fill + LEAD * l.rate as usize }) {
             return;
         }
         for k in q..(q + 1 + PRELOAD).min(self.queue.len()) {
