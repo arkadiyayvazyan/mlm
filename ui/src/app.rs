@@ -18,7 +18,7 @@ use crate::{fmt, Track};
 const ROW: f32 = 26.0;
 const NARROW: f32 = 600.0; // below this width (phones): two-line rows, touch-sized controls
 const ICON: f32 = 20.0; // the offline-copy column before the filename
-const OFFLINE_ICON: &str = "💾";
+const OFFLINE_ICON: &str = "⬇"; // same arrow as the download button
 
 pub struct App {
     tracks: Vec<Track>,
@@ -42,7 +42,8 @@ pub struct App {
     off: Offline,
     last_flush: f64, // egui time of the last retry of queued tag edits
     gen: u64,        // bumped whenever tracks or tags change: the filtered + sorted list is rebuilt only then
-    bpm: Option<(u32, u32)>, // BPM filter: center, ± range (hold the bpm column to open)
+    bpm: (u32, u32), // BPM filter: center, ± range; kept while off so the closing row still shows them
+    bpm_on: bool,    // hold the bpm column to turn on
     tags_open: bool,
     search_open: bool,
     focus_search: bool, // the search field takes focus once it's drawn
@@ -62,6 +63,7 @@ async fn get_json<T: serde::de::DeserializeOwned>(url: &str, unreachable: &std::
 
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
+        cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.12); // panes slide open fast (egui default 0.2 s)
         let inbox = Rc::new(RefCell::new(None));
         let off = Offline::new(&cc.egui_ctx);
         let (ib, ctx, unreachable) = (inbox.clone(), cc.egui_ctx.clone(), off.unreachable.clone());
@@ -102,7 +104,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, bpm: None, tags_open: false, search_open: false, focus_search: false, list_key: (String::new(), None, None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, tags_open: false, search_open: false, focus_search: false, list_key: (String::new(), None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -310,11 +312,13 @@ impl App {
                 if ui.add(b("⬇")).clicked() {
                     p.download();
                 }
-                bpm = ui.add(b("💓")).clicked();
+                let a = ui.add(b(""));
+                bars(ui, &a); // detect BPM: the logo's waveform, three bars
+                bpm = a.clicked();
                 // dimmed until an AIFF is fully in (its WAV is built from the PCM); a tap then says how far along it is
                 let ready = p.track().is_some_and(shares_original) || p.cur().is_some_and(|l| l.frames > 0 && l.loaded >= l.frames);
                 let dim = ui.visuals().weak_text_color();
-                share = self.can_share && ui.add(if ready { b("📤") } else { Button::new(RichText::new("📤").size(15.0).color(dim)).min_size(vec2(40.0, 40.0)) }).clicked();
+                share = self.can_share && ui.add(if ready { b("⬆") } else { Button::new(RichText::new("⬆").size(15.0).color(dim)).min_size(vec2(40.0, 40.0)) }).clicked();
             }));
             drop(p);
             if bpm {
@@ -342,13 +346,13 @@ impl App {
             self.header(ui, false); // phones: in the bottom panel, under the thumb
         }
         // filter + sort only when the query, sort, BPM filter or data changed: every frame costs too much on a phone
-        let key = (self.q.clone(), self.sort, self.bpm, self.gen);
+        let key = (self.q.clone(), self.sort, self.bpm_on.then_some(self.bpm), self.gen);
         if key != self.list_key {
             let q = self.q.trim().to_lowercase();
             let mut idx: Vec<usize> = (0..self.tracks.len())
                 .filter(|&i| {
                     let t = &self.tracks[i];
-                    self.bpm.is_none_or(|(c, r)| t.bpm > 0 && t.bpm.abs_diff(c) <= r)
+                    self.bpm_on.then_some(self.bpm).is_none_or(|(c, r)| t.bpm > 0 && t.bpm.abs_diff(c) <= r)
                         && (q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q))
                 })
                 .collect();
@@ -463,9 +467,9 @@ impl App {
         }
     }
 
-    /// Filter row while a BPM filter is on: center and ± range, − / + for thumbs, drag or tap the number for big jumps.
+    /// Filter row for the BPM filter: center and ± range, − / + for thumbs, drag or tap the number for big jumps.
     fn bpm_panel(&mut self, ui: &mut Ui) {
-        let Some((c, r)) = &mut self.bpm else { return };
+        let (c, r) = &mut self.bpm;
         let mut off = false;
         let narrow = ui.available_width() < NARROW;
         let h = if narrow { 40.0 } else { 0.0 };
@@ -486,7 +490,7 @@ impl App {
             off = ui.add(b(&label(narrow, "🗙", "🗙 bpm"))).on_hover_text("BPM filter off").clicked();
         }));
         if off {
-            self.bpm = None;
+            self.bpm_on = false;
         }
     }
 
@@ -498,7 +502,7 @@ impl App {
         for i in 0..5 {
             let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
             let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
-            let lit = arrow != "" || (i == 3 && self.bpm.is_some());
+            let lit = arrow != "" || (i == 3 && self.bpm_on);
             let r = match hdr {
                 None => ui.add(Button::new(RichText::new(label).size(13.0).color(if lit { text } else { weak })).frame(false).min_size(vec2(0.0, 40.0))),
                 Some(hdr) => {
@@ -513,9 +517,12 @@ impl App {
             if r.clicked() {
                 self.sort = match self.sort { Some((j, d)) if j == i => Some((i, !d)), _ => Some((i, false)) };
             }
-            if i == 3 && r.secondary_clicked() && self.bpm.is_none() {
+            if i == 3 && r.secondary_clicked() && !self.bpm_on {
                 let now = self.player.borrow().track().map_or(0, |t| t.bpm); // start around the playing track
-                self.bpm = Some((if now > 0 { now } else { 120 }, 4));
+                if now > 0 {
+                    self.bpm.0 = now;
+                }
+                self.bpm_on = true;
             }
         }
     }
@@ -559,6 +566,15 @@ fn chips(p: &Painter, all: &Tags, tags: &[String], mut x: f32, y: f32) {
         p.rect_filled(r, CornerRadius::same(8), tag_color(all, n));
         p.galley(r.min + vec2(7.0, 2.0), g, INK);
         x = r.right() + 4.0;
+    }
+}
+
+/// Three waveform bars (short, tall, medium), like the app icon, centered on a button.
+fn bars(ui: &Ui, r: &egui::Response) {
+    let c = ui.style().interact(r).fg_stroke.color;
+    for (k, h) in [8.0, 16.0, 11.0].into_iter().enumerate() {
+        let x = r.rect.center().x + (k as f32 - 1.0) * 5.5;
+        ui.painter().rect_filled(Rect::from_center_size(pos2(x, r.rect.center().y), vec2(3.0, h)), 1.5, c);
     }
 }
 
@@ -725,7 +741,7 @@ impl eframe::App for App {
         self.keys(&ui.ctx().clone());
         egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
         // search, tags, filters and (on phones) sorting sit just above the player: all in thumb reach
-        let controls_top = egui::Panel::bottom("search").show(ui, |ui| {
+        egui::Panel::bottom("search").show(ui, |ui| {
             ui.add_space(4.0);
             if self.off.unreachable.get() {
                 let n = self.off.pending.len();
@@ -743,10 +759,6 @@ impl eframe::App for App {
                     *self.install.borrow_mut() = None;
                 }
             }
-            if self.tags_open {
-                self.tags_panel(ui);
-            }
-            self.bpm_panel(ui);
             let h = if narrow { 40.0 } else { 0.0 }; // thumb-sized on phones
             // on phones the sort buttons, then the search and tags toggles at the right edge
             ui.horizontal(|ui| {
@@ -768,29 +780,38 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
         });
-        if self.search_open {
-            // at the top: at the bottom the phone keyboard would cover it
-            egui::Panel::top("search_field").show(ui, |ui| {
-                let h = if ui.available_width() < NARROW { 40.0 } else { 0.0 };
-                ui.add_space(4.0);
-                ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(Button::new(RichText::new("🗙").size(15.0)).min_size(vec2(h, h))).on_hover_text("clear and close").clicked() {
-                        self.q.clear();
-                        self.search_open = false;
-                    }
-                    let hint = format!("search {} tracks", self.tracks.len());
-                    let r = ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)).vertical_align(Align::Center));
-                    if std::mem::take(&mut self.focus_search) {
-                        r.request_focus();
-                    }
-                }));
-                ui.add_space(4.0);
-            });
-        }
-        egui::CentralPanel::default().show(ui, |ui| self.list(ui));
+        // panes slide out of the controls; `&mut { … }`: a copy, only our own buttons open and close them
+        egui::Panel::bottom("bpm_pane").resizable(false).show_collapsible(ui, &mut { self.bpm_on }, |ui| {
+            ui.add_space(4.0);
+            self.bpm_panel(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("tags_pane").resizable(false).show_collapsible(ui, &mut { self.tags_open }, |ui| {
+            ui.add_space(4.0);
+            self.tags_panel(ui);
+            ui.add_space(4.0);
+        });
+        // search at the top: at the bottom the phone keyboard would cover it
+        egui::Panel::top("search_field").resizable(false).show_collapsible(ui, &mut { self.search_open }, |ui| {
+            let h = if ui.available_width() < NARROW { 40.0 } else { 0.0 };
+            ui.add_space(4.0);
+            ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(Button::new(RichText::new("🗙").size(15.0)).min_size(vec2(h, h))).on_hover_text("clear and close").clicked() {
+                    self.q.clear();
+                    self.search_open = false;
+                }
+                let hint = format!("search {} tracks", self.tracks.len());
+                let r = ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)).vertical_align(Align::Center));
+                if std::mem::take(&mut self.focus_search) {
+                    r.request_focus();
+                }
+            }));
+            ui.add_space(4.0);
+        });
+        let list = egui::CentralPanel::default().show(ui, |ui| self.list(ui));
         if let Some((msg, _)) = &self.status {
-            // just above the bottom controls, where the eyes are after a tap
-            let at = pos2(ui.ctx().content_rect().center().x, controls_top.response.rect.top() - 8.0);
+            // just above the bottom controls and panes, where the eyes are after a tap
+            let at = pos2(ui.ctx().content_rect().center().x, list.response.rect.bottom() - 8.0);
             egui::Area::new("status".into()).pivot(Align2::CENTER_BOTTOM).fixed_pos(at).show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| ui.add(Label::new(msg.as_str()).wrap_mode(egui::TextWrapMode::Extend)));
             });
