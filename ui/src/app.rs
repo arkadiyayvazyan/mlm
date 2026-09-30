@@ -49,8 +49,9 @@ pub struct App {
     tags_open: bool,
     search_open: bool,
     focus_search: bool, // the search field takes focus once it's drawn
-    new_tag_open: bool, // hold the tags button or press #
+    new_tag_open: bool, // hold the tags button or press #; hold a tag to edit it
     focus_new_tag: bool,
+    editing: Option<String>, // the tag the pane edits (its current name), None = new tag
     // (query, sort, bpm, offline copies when filtering on them, added span, gen) the cached list was built for
     list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, Option<usize>, Option<usize>, u64),
     list_idx: Vec<usize>, // that list, as indices into `tracks`
@@ -109,7 +110,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, added: 4, added_on: false, tags_open: false, search_open: false, focus_search: false, new_tag_open: false, focus_new_tag: false, list_key: (String::new(), None, None, None, None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, added: 4, added_on: false, tags_open: false, search_open: false, focus_search: false, new_tag_open: false, focus_new_tag: false, editing: None, list_key: (String::new(), None, None, None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -240,7 +241,11 @@ impl App {
                 "l" => p.skip(60.0),
                 "?" => self.help = !self.help,
                 "/" => (self.search_open, self.focus_search) = (true, true),
-                "#" => (self.new_tag_open, self.focus_new_tag) = (true, true),
+                "#" => {
+                    drop(p);
+                    (self.new_tag_open, self.focus_new_tag) = (true, true);
+                    self.new_tag();
+                }
                 _ => {
                     drop(p);
                     let name = self.tags.keys.iter().find(|(_, v)| **v == k).map(|(n, _)| n.clone());
@@ -265,24 +270,45 @@ impl App {
                 // always full pastel; a bright outline marks tags on the playing track
                 let stroke = if on { egui::Stroke::new(2.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
                 let b = ui.add(Button::new(RichText::new(if narrow { n.clone() } else { format!("{n}  {k}") }).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke).min_size(vec2(0.0, h)));
-                let b = b.on_hover_text(format!("press {k} to toggle on the playing track; hold (right-click) to delete"));
+                let b = b.on_hover_text(format!("press {k} to toggle on the playing track; hold (right-click) to edit"));
                 if let (true, Some(rel)) = (b.clicked(), now.clone()) {
                     self.edit(Op::Tag { on: !on, rel, name: n.clone() });
                 }
-                let confirm = |m: &str| web_sys::window().unwrap().confirm_with_message(m).unwrap_or(false);
-                if b.secondary_clicked() && confirm(&format!("Delete \"{n}\" from all tracks?")) {
-                    self.edit(Op::Remove { name: n.clone() });
+                if b.secondary_clicked() {
+                    (self.new_name, self.new_key, self.editing) = (n.clone(), k.clone(), Some(n.clone()));
+                    (self.new_tag_open, self.focus_new_tag) = (true, true);
+                    self.err.clear();
                 }
             }
         });
     }
 
-    /// New tag: name, key, ➕ (or Enter); closes once the tag is added.
+    /// The pane makes a new tag (leaving a tag it was editing).
+    fn new_tag(&mut self) {
+        if self.editing.take().is_some() {
+            self.new_name.clear();
+            self.new_key.clear();
+        }
+    }
+
+    /// New tag: name, key, ➕ (or Enter); or, holding a tag, its name and key with ✔ save and 🗑 delete.
+    /// Closes once done.
     fn new_tag_panel(&mut self, ui: &mut Ui) {
         let narrow = ui.available_width() < NARROW;
         let h = if narrow { 40.0 } else { 0.0 };
         ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let add = ui.add(Button::new(RichText::new(label(narrow, "➕", "➕ add")).size(15.0)).min_size(vec2(h, h))).clicked();
+            let b = |s: String| Button::new(RichText::new(s).size(15.0)).min_size(vec2(h, h));
+            let add = match self.editing.clone() {
+                None => ui.add(b(label(narrow, "➕", "➕ add"))).clicked(),
+                Some(old) => {
+                    let confirm = |m: &str| web_sys::window().unwrap().confirm_with_message(m).unwrap_or(false);
+                    if ui.add(b("🗑".into())).on_hover_text("delete tag").clicked() && confirm(&format!("Delete \"{old}\" from all tracks?")) {
+                        self.edit(Op::Remove { name: old });
+                        (self.new_tag_open, self.editing) = (false, None);
+                    }
+                    ui.add(b(label(narrow, "✔", "✔ save"))).clicked()
+                }
+            };
             let b = ui.add(TextEdit::singleline(&mut self.new_key).hint_text("key").char_limit(1).desired_width(40.0).min_size(vec2(0.0, h)).vertical_align(Align::Center));
             let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(140.0).min_size(vec2(0.0, h)).vertical_align(Align::Center));
             if std::mem::take(&mut self.focus_new_tag) {
@@ -293,12 +319,15 @@ impl App {
             }
             let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter));
             if add || enter {
-                match self.tags.add(&self.new_name, &self.new_key) {
+                let done = match self.editing.clone() {
+                    None => self.tags.add(&self.new_name, &self.new_key).map(|()| self.color_new_tags()), // queues the Define (key + hue)
+                    Some(old) => self.tags.edit(&old, &self.new_name, &self.new_key).map(|ops| ops.into_iter().for_each(|op| self.edit(op))),
+                };
+                match done {
                     Ok(()) => {
-                        self.color_new_tags(); // queues the new tag's Define (key + hue)
                         self.new_name.clear();
                         self.new_key.clear();
-                        self.new_tag_open = false;
+                        (self.new_tag_open, self.editing) = (false, None);
                     }
                     Err(e) => self.err = e,
                 }
@@ -327,7 +356,8 @@ impl App {
             ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 controls(ui, &mut p, 22.0, vec2(56.0, 40.0));
                 let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(40.0, 40.0));
-                if ui.add(b("⬇")).clicked() {
+                let arrow = |s: &str| Button::new(RichText::new(s).size(22.0)).min_size(vec2(40.0, 40.0));
+                if ui.add(arrow("⬇")).clicked() {
                     p.download();
                 }
                 let a = ui.add(b(""));
@@ -336,7 +366,7 @@ impl App {
                 // dimmed until an AIFF is fully in (its WAV is built from the PCM); a tap then says how far along it is
                 let ready = p.track().is_some_and(shares_original) || p.cur().is_some_and(|l| l.frames > 0 && l.loaded >= l.frames);
                 let dim = ui.visuals().weak_text_color();
-                share = self.can_share && ui.add(if ready { b("⬆") } else { Button::new(RichText::new("⬆").size(15.0).color(dim)).min_size(vec2(40.0, 40.0)) }).clicked();
+                share = self.can_share && ui.add(if ready { arrow("⬆") } else { Button::new(RichText::new("⬆").size(22.0).color(dim)).min_size(vec2(40.0, 40.0)) }).clicked();
             }));
             drop(p);
             if bpm {
@@ -843,8 +873,9 @@ impl eframe::App for App {
                         self.tags_open = !self.tags_open;
                     }
                     if t.secondary_clicked() {
-                        self.new_tag_open = !self.new_tag_open;
+                        self.new_tag_open = !self.new_tag_open || self.editing.is_some();
                         self.focus_new_tag = self.new_tag_open;
+                        self.new_tag();
                     }
                     // lit while a query filters the list, even with the field hidden
                     if ui.add(b(label(narrow, "🔍", "🔍 search"), self.search_open || !self.q.is_empty())).clicked() {
