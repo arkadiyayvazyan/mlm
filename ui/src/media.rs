@@ -76,6 +76,21 @@ impl Media {
             let _ = w.add_event_listener_with_callback_and_bool(ev, unlock.as_ref().unchecked_ref(), true);
         }
         unlock.forget();
+        // ponytail: temporary probe, the silent element's state and page lifecycle around app switches
+        let (el2, d) = (el.clone(), w.document().unwrap());
+        let ev = Closure::<dyn Fn(web_sys::Event)>::new(move |e: web_sys::Event| {
+            crate::player::beacon(&format!("event {} (silent el paused {})", e.type_(), el2.paused()))
+        });
+        for t in ["pause", "play", "playing", "waiting", "stalled", "ended", "emptied"] {
+            let _ = el.add_event_listener_with_callback(t, ev.as_ref().unchecked_ref());
+        }
+        for t in ["blur", "focus", "pagehide", "pageshow"] {
+            let _ = w.add_event_listener_with_callback(t, ev.as_ref().unchecked_ref());
+        }
+        for t in ["freeze", "resume"] {
+            let _ = d.add_event_listener_with_callback(t, ev.as_ref().unchecked_ref());
+        }
+        ev.forget();
         Self { el, session, id: None, playing: false, pos: (0.0, 0.0) }
     }
 

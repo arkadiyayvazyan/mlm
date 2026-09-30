@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use js_sys::{Atomics, Float32Array, Int32Array, Object, Reflect, SharedArrayBuffer, Uint8Array};
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     AbortController, AbortSignal, AudioContext, AudioContextOptions, AudioContextState, AudioWorkletNode,
@@ -245,7 +245,7 @@ impl Player {
         let (now, r, rate) = (js_sys::Date::now(), ring.read(), ctx.sample_rate() as f64);
         let buf = ring.w.wrapping_sub(r);
         let hidden = web_sys::window().unwrap().document().unwrap().hidden();
-        let log = |m: String| web_sys::window().unwrap().navigator().send_beacon_with_opt_str("/api/log", Some(&m));
+        let log = |m: String| beacon(&m);
         if let Some((t, r0, b0, h0)) = *last {
             let (dt, played) = ((now - t) / 1000.0, r.wrapping_sub(r0) as f64 / rate);
             if hidden != h0 {
@@ -317,6 +317,11 @@ impl Player {
     }
 }
 
+/// ponytail: temporary, the dropout probe's line to the Pi's journal
+pub fn beacon(m: &str) {
+    let _ = web_sys::window().unwrap().navigator().send_beacon_with_opt_str("/api/log", Some(m));
+}
+
 fn new_ctx(rate: u32, sab: &SharedArrayBuffer) -> AudioContext {
     let o = AudioContextOptions::new();
     if rate > 0 {
@@ -332,7 +337,18 @@ fn new_ctx(rate: u32, sab: &SharedArrayBuffer) -> AudioContext {
             Reflect::set(&p, &"sab".into(), &sab)?;
             o.set_processor_options(Some(&p));
             o.set_output_channel_count(&js_sys::Array::of1(&2.into()));
-            AudioWorkletNode::new_with_options(&c, "ring", &o)?.connect_with_audio_node(&c.destination())?;
+            let node = AudioWorkletNode::new_with_options(&c, "ring", &o)?;
+            node.connect_with_audio_node(&c.destination())?;
+            // ponytail: temporary probe, worklet.js posts gaps between its callbacks; ctx state changes
+            let gap = Closure::<dyn Fn(JsValue)>::new(|e: JsValue| {
+                beacon(&format!("worklet {}", Reflect::get(&e, &"data".into()).unwrap_or_default().as_string().unwrap_or_default()))
+            });
+            Reflect::set(&Reflect::get(&node, &"port".into())?, &"onmessage".into(), gap.as_ref())?;
+            gap.forget();
+            let c2 = c.clone();
+            let state = Closure::<dyn Fn()>::new(move || beacon(&format!("ctx {:?}", c2.state())));
+            c.set_onstatechange(Some(state.as_ref().unchecked_ref()));
+            state.forget();
             Ok(())
         }
         .await;
