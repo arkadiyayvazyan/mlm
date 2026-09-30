@@ -44,13 +44,15 @@ pub struct App {
     bpm: (u32, u32), // BPM filter: center, ± range; kept while off so the closing row still shows them
     bpm_on: bool,    // hold the bpm column to turn on
     offline_only: bool, // tap the offline column: only tracks with a copy on this device
+    added: usize,   // index into ADDED_SPANS; kept while off so the closing row still shows it
+    added_on: bool, // hold the added column to turn on
     tags_open: bool,
     search_open: bool,
     focus_search: bool, // the search field takes focus once it's drawn
     new_tag_open: bool, // hold the tags button or press #
     focus_new_tag: bool,
-    // (query, sort, bpm, offline copies when filtering on them, gen) the cached list was built for
-    list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, Option<usize>, u64),
+    // (query, sort, bpm, offline copies when filtering on them, added span, gen) the cached list was built for
+    list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, Option<usize>, Option<usize>, u64),
     list_idx: Vec<usize>, // that list, as indices into `tracks`
     fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
 }
@@ -107,7 +109,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, tags_open: false, search_open: false, focus_search: false, new_tag_open: false, focus_new_tag: false, list_key: (String::new(), None, None, None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, added: 4, added_on: false, tags_open: false, search_open: false, focus_search: false, new_tag_open: false, focus_new_tag: false, list_key: (String::new(), None, None, None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -363,15 +365,18 @@ impl App {
         }
         // filter + sort only when the query, sort, BPM filter or data changed: every frame costs too much on a phone
         // ponytail: offline copies keyed by count, a swap of one copy for another in one frame goes unseen
-        let key = (self.q.clone(), self.sort, self.bpm_on.then_some(self.bpm), self.offline_only.then(|| self.off.have.borrow().len()), self.gen);
+        // ponytail: the added span is judged against "now" when the list is rebuilt, not every frame
+        let key = (self.q.clone(), self.sort, self.bpm_on.then_some(self.bpm), self.offline_only.then(|| self.off.have.borrow().len()), self.added_on.then_some(self.added), self.gen);
         if key != self.list_key {
             let q = self.q.trim().to_lowercase();
             let have = self.off.have.borrow();
+            let since = (js_sys::Date::now() / 1000.0) as u64 - ADDED_SPANS[self.added].0 * 86_400;
             let mut idx: Vec<usize> = (0..self.tracks.len())
                 .filter(|&i| {
                     let t = &self.tracks[i];
                     self.bpm_on.then_some(self.bpm).is_none_or(|(c, r)| t.bpm > 0 && t.bpm.abs_diff(c) <= r)
                         && (!self.offline_only || have.contains(&t.id))
+                        && (!self.added_on || t.added >= since)
                         && (q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q))
                 })
                 .collect();
@@ -518,6 +523,23 @@ impl App {
         }
     }
 
+    /// Filter row for the added filter: 🗙, − span +.
+    fn added_panel(&mut self, ui: &mut Ui) {
+        let narrow = ui.available_width() < NARROW;
+        let h = if narrow { 40.0 } else { 0.0 };
+        let mut off = false;
+        ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(h, h));
+            if ui.add(b("+")).clicked() { self.added = (self.added + 1).min(ADDED_SPANS.len() - 1) }
+            ui.label(format!("added in the last {}", ADDED_SPANS[self.added].1));
+            if ui.add(b("−")).clicked() { self.added = self.added.saturating_sub(1) }
+            off = ui.add(b(&label(narrow, "🗙", "🗙 added"))).on_hover_text("added filter off").clicked();
+        }));
+        if off {
+            self.added_on = false;
+        }
+    }
+
     /// Column header: click a column to sort by it, again to reverse; hold (right-click) bpm to filter by BPM.
     fn header(&mut self, ui: &mut Ui, narrow: bool) {
         let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color());
@@ -535,7 +557,7 @@ impl App {
         for i in 0..5 {
             let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
             let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
-            let lit = arrow != "" || (i == 3 && self.bpm_on);
+            let lit = arrow != "" || (i == 3 && self.bpm_on) || (i == 4 && self.added_on);
             let r = match hdr {
                 None => ui.add(Button::new(RichText::new(label).size(13.0).color(if lit { text } else { weak })).frame(false).min_size(vec2(0.0, 40.0))),
                 Some(hdr) => {
@@ -549,6 +571,9 @@ impl App {
             };
             if r.clicked() {
                 self.sort = match self.sort { Some((j, d)) if j == i => Some((i, !d)), _ => Some((i, false)) };
+            }
+            if i == 4 && r.secondary_clicked() {
+                self.added_on = !self.added_on;
             }
             if i == 3 && r.secondary_clicked() && !self.bpm_on {
                 let now = self.player.borrow().track().map_or(0, |t| t.bpm); // start around the playing track
@@ -568,6 +593,9 @@ fn cols(w: f32) -> [(f32, f32); 5] {
     let x = 16.0 + ICON;
     [(x, 2.0 * fr), (x + 8.0 + 2.0 * fr, fr), (x + 16.0 + 3.0 * fr, 56.0), (x + 80.0 + 3.0 * fr, 42.0), (x + 130.0 + 3.0 * fr, 64.0)]
 }
+
+/// Spans for the added filter: days and label.
+const ADDED_SPANS: [(u64, &str); 8] = [(1, "day"), (3, "3 days"), (7, "week"), (14, "2 weeks"), (30, "month"), (90, "3 months"), (180, "6 months"), (365, "year")];
 
 /// Button text: just the icon on phones, `text` otherwise.
 fn label(narrow: bool, icon: &str, text: &str) -> String {
@@ -804,7 +832,7 @@ impl eframe::App for App {
             let h = if narrow { 40.0 } else { 0.0 }; // thumb-sized on phones
             // on phones the sort buttons, then the search and tags toggles at the right edge
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0; // fits a 360 pt phone
+                ui.spacing_mut().item_spacing.x = 8.0; // still fits a 360 pt phone
                 if narrow {
                     self.header(ui, true);
                 }
@@ -831,6 +859,11 @@ impl eframe::App for App {
         egui::Panel::bottom("bpm_pane").resizable(false).show_collapsible(ui, &mut { self.bpm_on }, |ui| {
             ui.add_space(4.0);
             self.bpm_panel(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("added_pane").resizable(false).show_collapsible(ui, &mut { self.added_on }, |ui| {
+            ui.add_space(4.0);
+            self.added_panel(ui);
             ui.add_space(4.0);
         });
         egui::Panel::bottom("tags_pane").resizable(false).show_collapsible(ui, &mut { self.tags_open }, |ui| {
@@ -883,7 +916,7 @@ impl eframe::App for App {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "? — this help", "/ — search", "# — new tag", "hold (right-click) the bpm column — filter by BPM ± range", "tap the time (0:42 / 5:10) — frame-rate readout"] {
+                          "? — this help", "/ — search", "# — new tag", "hold (right-click) the bpm / added column — filter by BPM ± range / added in the last …", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");
