@@ -278,27 +278,29 @@ impl App {
         });
     }
 
-    /// Phones: one finger-sized toggle per tag on the playing track; stays open for several toggles.
+    /// Phones: a thumb-reachable column of tag toggles for the playing track, pinned bottom-right (see ui());
+    /// stays open for several toggles, scrolls when the tags outgrow the screen.
     fn tag_buttons(&mut self, ui: &mut Ui) {
         let Some(rel) = self.now_rel() else {
             ui.label("nothing playing");
             return;
         };
-        ui.set_max_width(ui.ctx().content_rect().width() - 48.0);
-        ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
-        ui.horizontal_wrapped(|ui| {
+        let screen = ui.ctx().content_rect();
+        let w = (screen.width() * 0.55).clamp(160.0, 260.0);
+        ui.set_width(w);
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        ScrollArea::vertical().max_height(screen.height() - 120.0).show(ui, |ui| {
             for n in self.tags.keys.keys().cloned().collect::<Vec<_>>() {
                 let on = self.tags.has(&rel, &n);
                 let stroke = if on { egui::Stroke::new(3.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
                 let fill = if on { tag_color(&self.tags, &n) } else { tag_color(&self.tags, &n).gamma_multiply(0.45) };
-                let b = Button::new(RichText::new(&n).size(18.0).color(INK)).fill(fill).stroke(stroke).min_size(vec2(96.0, 52.0));
+                let b = Button::new(RichText::new(&n).size(18.0).color(INK)).fill(fill).stroke(stroke).min_size(vec2(w, 52.0));
                 if ui.add(b).clicked() {
                     self.edit(Op::Tag { on: !on, rel: rel.clone(), name: n });
                 }
             }
         });
-        ui.add_space(6.0);
-        if ui.add(Button::new(RichText::new("done").size(18.0)).min_size(vec2(ui.available_width(), 48.0))).clicked() {
+        if ui.add(Button::new(RichText::new("done").size(18.0)).min_size(vec2(w, 52.0))).clicked() {
             self.tag_modal = false;
         }
     }
@@ -707,7 +709,8 @@ impl eframe::App for App {
             ui.ctx().request_repaint();
         }
         if self.tag_modal {
-            let m = egui::Modal::new("tag".into()).show(ui.ctx(), |ui| self.tag_buttons(ui));
+            let area = egui::Modal::default_area("tag".into()).anchor(Align2::RIGHT_BOTTOM, vec2(-8.0, -8.0));
+            let m = egui::Modal::new("tag".into()).area(area).show(ui.ctx(), |ui| self.tag_buttons(ui));
             if m.should_close() {
                 self.tag_modal = false;
             }
