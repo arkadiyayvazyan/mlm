@@ -264,7 +264,7 @@ impl App {
                 let on = now.as_ref().is_some_and(|r| self.tags.has(r, &n));
                 // always full pastel; a bright outline marks tags on the playing track
                 let stroke = if on { egui::Stroke::new(2.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
-                let b = ui.add(Button::new(RichText::new(format!("{n}  {k}")).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke).min_size(vec2(0.0, h)));
+                let b = ui.add(Button::new(RichText::new(if narrow { n.clone() } else { format!("{n}  {k}") }).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke).min_size(vec2(0.0, h)));
                 let b = b.on_hover_text(format!("press {k} to toggle on the playing track; hold (right-click) to delete"));
                 if let (true, Some(rel)) = (b.clicked(), now.clone()) {
                     self.edit(Op::Tag { on: !on, rel, name: n.clone() });
