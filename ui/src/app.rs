@@ -44,6 +44,8 @@ pub struct App {
     gen: u64,        // bumped whenever tracks or tags change: the filtered + sorted list is rebuilt only then
     bpm: Option<(u32, u32)>, // BPM filter: center, ± range (hold the bpm column to open)
     tags_open: bool,
+    search_open: bool,
+    focus_search: bool, // the search field takes focus once it's drawn
     list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, u64), // (query, sort, bpm, gen) the cached list was built for
     list_idx: Vec<usize>, // that list, as indices into `tracks`
     fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
@@ -100,7 +102,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, bpm: None, tags_open: false, list_key: (String::new(), None, None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: None, tags_open: false, search_open: false, focus_search: false, list_key: (String::new(), None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -229,6 +231,7 @@ impl App {
                 "h" => p.skip(-60.0),
                 "l" => p.skip(60.0),
                 "?" => self.help = !self.help,
+                "/" => (self.search_open, self.focus_search) = (true, true),
                 _ => {
                     drop(p);
                     let name = self.tags.keys.iter().find(|(_, v)| **v == k).map(|(n, _)| n.clone());
@@ -243,27 +246,20 @@ impl App {
 
     fn tags_panel(&mut self, ui: &mut Ui) {
         let now = self.now_rel();
-        ui.horizontal_wrapped(|ui| {
-            for (n, k) in self.tags.keys.clone() {
-                let on = now.as_ref().is_some_and(|r| self.tags.has(r, &n));
-                // always full pastel; a bright outline marks tags on the playing track
-                let stroke = if on { egui::Stroke::new(2.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
-                let b = ui.add(Button::new(RichText::new(format!("{n}  {k}")).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke));
-                if let (true, Some(rel)) = (b.on_hover_text(format!("press {k} to toggle on the playing track")).clicked(), now.clone()) {
-                    self.edit(Op::Tag { on: !on, rel, name: n.clone() });
-                }
-                let confirm = |m: &str| web_sys::window().unwrap().confirm_with_message(m).unwrap_or(false);
-                if ui.button("🗙").on_hover_text("delete tag").clicked() && confirm(&format!("Delete \"{n}\" from all tracks?")) {
-                    self.edit(Op::Remove { name: n.clone() });
-                }
+        let narrow = ui.available_width() < NARROW;
+        // right-aligned, in thumb reach; right-to-left adds the widgets in reverse: reads tag 🗙 … new tag, key, ➕
+        ui.with_layout(Layout::right_to_left(Align::Center).with_main_wrap(true), |ui| {
+            if !self.err.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, &self.err);
             }
-            let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(100.0));
+            let add = ui.button(label(narrow, "➕", "add")).clicked();
             let b = ui.add(TextEdit::singleline(&mut self.new_key).hint_text("key").char_limit(1).desired_width(30.0));
+            let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(100.0));
             if a.changed() || b.changed() {
                 self.err.clear();
             }
             let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter));
-            if ui.button("add").clicked() || enter {
+            if add || enter {
                 match self.tags.add(&self.new_name, &self.new_key) {
                     Ok(()) => {
                         self.color_new_tags(); // queues the new tag's Define (key + hue)
@@ -273,8 +269,18 @@ impl App {
                     Err(e) => self.err = e,
                 }
             }
-            if !self.err.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, &self.err);
+            for (n, k) in self.tags.keys.clone().into_iter().rev() {
+                let on = now.as_ref().is_some_and(|r| self.tags.has(r, &n));
+                // always full pastel; a bright outline marks tags on the playing track
+                let stroke = if on { egui::Stroke::new(2.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
+                let confirm = |m: &str| web_sys::window().unwrap().confirm_with_message(m).unwrap_or(false);
+                if ui.button("🗙").on_hover_text("delete tag").clicked() && confirm(&format!("Delete \"{n}\" from all tracks?")) {
+                    self.edit(Op::Remove { name: n.clone() });
+                }
+                let b = ui.add(Button::new(RichText::new(format!("{n}  {k}")).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke));
+                if let (true, Some(rel)) = (b.on_hover_text(format!("press {k} to toggle on the playing track")).clicked(), now.clone()) {
+                    self.edit(Op::Tag { on: !on, rel, name: n.clone() });
+                }
             }
         });
     }
@@ -293,17 +299,16 @@ impl App {
                 self.fps = if self.fps.is_some() { None } else { Some((0.0, 0.0)) };
             }
             let (mut share, mut bpm) = (false, false);
-            ui.horizontal(|ui| {
+            // all right-aligned, transport at the edge under the thumb: 📤 💓 ⬇ ⏮ ⏵ ⏭
+            ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 controls(ui, &mut p, 22.0, vec2(56.0, 40.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(40.0, 40.0));
-                    share = self.can_share && ui.add(b("share")).clicked();
-                    bpm = ui.add(b("bpm")).clicked();
-                    if ui.add(b("⬇")).clicked() {
-                        p.download();
-                    }
-                });
-            });
+                let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(40.0, 40.0));
+                if ui.add(b("⬇")).clicked() {
+                    p.download();
+                }
+                bpm = ui.add(b("💓")).clicked();
+                share = self.can_share && ui.add(b("📤")).clicked();
+            }));
             drop(p);
             if bpm {
                 self.analyze(&ui.ctx().clone());
@@ -455,29 +460,31 @@ impl App {
     fn bpm_panel(&mut self, ui: &mut Ui) {
         let Some((c, r)) = &mut self.bpm else { return };
         let mut off = false;
-        ui.horizontal(|ui| {
-            let h = if ui.available_width() < NARROW { 40.0 } else { 0.0 };
-            if h > 0.0 {
+        let narrow = ui.available_width() < NARROW;
+        let h = if narrow { 40.0 } else { 0.0 };
+        // right-aligned, in thumb reach; right-to-left adds the widgets in reverse: reads 🗙 − 124 + ± − 4 +
+        ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if narrow {
                 ui.spacing_mut().interact_size.y = h;
                 ui.spacing_mut().item_spacing.x = 4.0; // fits a 360 pt phone
             }
             let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(h, h));
-            off = ui.add(b("✕ bpm")).on_hover_text("BPM filter off").clicked();
-            if ui.add(b("−")).clicked() { *c = c.saturating_sub(1).max(1) }
-            ui.add(DragValue::new(c).range(1..=300));
-            if ui.add(b("+")).clicked() { *c = (*c + 1).min(300) }
-            ui.label("±");
-            if ui.add(b("−")).clicked() { *r = r.saturating_sub(1) }
-            ui.add(DragValue::new(r).range(0..=50));
             if ui.add(b("+")).clicked() { *r = (*r + 1).min(50) }
-        });
+            ui.add(DragValue::new(r).range(0..=50));
+            if ui.add(b("−")).clicked() { *r = r.saturating_sub(1) }
+            ui.label("±");
+            if ui.add(b("+")).clicked() { *c = (*c + 1).min(300) }
+            ui.add(DragValue::new(c).range(1..=300));
+            if ui.add(b("−")).clicked() { *c = c.saturating_sub(1).max(1) }
+            off = ui.add(b(&label(narrow, "🗙", "🗙 bpm"))).on_hover_text("BPM filter off").clicked();
+        }));
         if off {
             self.bpm = None;
         }
     }
 
     /// Column header: click a column to sort by it, again to reverse; hold (right-click) bpm to filter by BPM.
-    /// On phones just five equal buttons.
+    /// On phones just five equal icon buttons.
     fn header(&mut self, ui: &mut Ui, narrow: bool) {
         let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color());
         let hdr_h = if narrow { 40.0 } else { ROW };
@@ -487,7 +494,8 @@ impl App {
             let c = Rect::from_min_size(pos2(hdr.left() + x, hdr.top()), vec2(cw, hdr_h));
             let r = ui.interact(c, ui.id().with(("sort", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
             let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
-            let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
+            let names = if narrow { ["🗋", "🔖", "⏱", "♩", "📅"] } else { ["filename", "tags", "duration", "bpm", "added"] };
+            let label = format!("{}{arrow}", names[i]);
             let (at, align) = if i < 2 || narrow { (c.left_center(), Align2::LEFT_CENTER) } else { (c.right_center(), Align2::RIGHT_CENTER) };
             let color = if r.hovered() || arrow != "" || (i == 3 && self.bpm.is_some()) { text } else { weak };
             ui.painter().with_clip_rect(c).text(at, align, label, FontId::proportional(13.0), color);
@@ -508,6 +516,11 @@ fn cols(w: f32) -> [(f32, f32); 5] {
     let fr = ((w - 32.0 - ICON - 32.0 - 56.0 - 42.0 - 64.0) / 3.0).max(0.0);
     let x = 16.0 + ICON;
     [(x, 2.0 * fr), (x + 8.0 + 2.0 * fr, fr), (x + 16.0 + 3.0 * fr, 56.0), (x + 80.0 + 3.0 * fr, 42.0), (x + 130.0 + 3.0 * fr, 64.0)]
+}
+
+/// Button text: just the icon on phones, `text` otherwise.
+fn label(narrow: bool, icon: &str, text: &str) -> String {
+    (if narrow { icon } else { text }).to_owned()
 }
 
 /// Unix seconds as local yy/mm/dd.
@@ -540,9 +553,17 @@ fn chips(p: &Painter, all: &Tags, tags: &[String], mut x: f32, y: f32) {
 
 fn controls(ui: &mut Ui, p: &mut Player, size: f32, min: Vec2) {
     let b = |s: &str| Button::new(RichText::new(s).size(size)).min_size(min);
-    if ui.add(b("⏮")).clicked() { p.prev() }
-    if ui.add(b(if p.playing() { "⏸" } else { "▶" })).clicked() { p.toggle() }
-    if ui.add(b("⏭")).clicked() { p.next() }
+    let mut order = [0, 1, 2];
+    if ui.layout().prefer_right_to_left() {
+        order.reverse(); // still reads ⏮ ⏵ ⏭
+    }
+    for k in order {
+        match k {
+            0 => if ui.add(b("⏮")).clicked() { p.prev() },
+            1 => if ui.add(b(if p.playing() { "⏸" } else { "▶" })).clicked() { p.toggle() },
+            _ => if ui.add(b("⏭")).clicked() { p.next() },
+        }
+    }
 }
 
 /// Title — artist (with `time` right-aligned beside it, on phones), and the waveform seek bar under it.
@@ -700,9 +721,11 @@ impl eframe::App for App {
                 let queued = if n > 0 { format!(" · {n} tag change{} waiting to sync", if n == 1 { "" } else { "s" }) } else { String::new() };
                 ui.weak(format!("offline: playing downloaded tracks{queued}"));
             }
+            let narrow = ui.available_width() < NARROW;
             let offer = self.install.borrow().clone();
             if let Some(e) = offer {
-                if ui.button("install app").clicked() {
+                let b = ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.button(label(narrow, "📲", "install app")).clicked()).inner).inner;
+                if b {
                     if let Ok(f) = js_sys::Reflect::get(&e, &"prompt".into()).and_then(|f| f.dyn_into::<js_sys::Function>()) {
                         let _ = f.call0(&e); // inside the click: egui runs click logic in the pointer event
                     }
@@ -713,18 +736,29 @@ impl eframe::App for App {
                 self.tags_panel(ui);
             }
             self.bpm_panel(ui);
-            let narrow = ui.available_width() < NARROW;
-            if narrow {
-                self.header(ui, true);
+            let h = if narrow { 40.0 } else { 0.0 }; // thumb-sized on phones
+            if self.search_open {
+                let hint = format!("search {} tracks", self.tracks.len());
+                let r = ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
+                if std::mem::take(&mut self.focus_search) {
+                    r.request_focus();
+                }
             }
-            let hint = format!("search {} tracks", self.tracks.len());
-            let h = if narrow { 36.0 } else { 0.0 }; // thumb-sized on phones
+            // search and tags toggles at the right edge; on phones the sort buttons fill the rest of the row
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(Button::new("tags").selected(self.tags_open).min_size(vec2(56.0, h))).clicked() {
+                    let b = |s: String, on: bool| Button::new(RichText::new(s).size(15.0)).selected(on).min_size(vec2(h, h));
+                    if ui.add(b(label(narrow, "🏷", "🏷 tags"), self.tags_open)).clicked() {
                         self.tags_open = !self.tags_open;
                     }
-                    ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
+                    // lit while a query filters the list, even with the field hidden
+                    if ui.add(b(label(narrow, "🔍", "🔍 search"), self.search_open || !self.q.is_empty())).clicked() {
+                        self.search_open = !self.search_open;
+                        self.focus_search = self.search_open;
+                    }
+                    if narrow {
+                        self.header(ui, true);
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -745,7 +779,7 @@ impl eframe::App for App {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "? — this help", "hold (right-click) the bpm column — filter by BPM ± range", "tap the time (0:42 / 5:10) — frame-rate readout"] {
+                          "? — this help", "/ — search", "hold (right-click) the bpm column — filter by BPM ± range", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");
