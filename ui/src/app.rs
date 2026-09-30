@@ -30,6 +30,7 @@ pub struct App {
     new_key: String,
     err: String,
     help: bool,
+    tag_modal: bool, // phones: big tag buttons for the playing track
     shown_id: Option<u64>, // playing track as of last frame: scroll when it changes
     view: (f32, f32),      // list scroll offset and height as of last frame
     sort: Option<(usize, bool)>, // column, descending; None = library order
@@ -96,7 +97,7 @@ impl App {
         tick.forget();
         Self {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
-            new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
+            new_key: String::new(), err: String::new(), help: false, tag_modal: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
             off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
         }
@@ -277,6 +278,31 @@ impl App {
         });
     }
 
+    /// Phones: one finger-sized toggle per tag on the playing track; stays open for several toggles.
+    fn tag_buttons(&mut self, ui: &mut Ui) {
+        let Some(rel) = self.now_rel() else {
+            ui.label("nothing playing");
+            return;
+        };
+        ui.set_max_width(ui.ctx().content_rect().width() - 48.0);
+        ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+        ui.horizontal_wrapped(|ui| {
+            for n in self.tags.keys.keys().cloned().collect::<Vec<_>>() {
+                let on = self.tags.has(&rel, &n);
+                let stroke = if on { egui::Stroke::new(3.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
+                let fill = if on { tag_color(&self.tags, &n) } else { tag_color(&self.tags, &n).gamma_multiply(0.45) };
+                let b = Button::new(RichText::new(&n).size(18.0).color(INK)).fill(fill).stroke(stroke).min_size(vec2(96.0, 52.0));
+                if ui.add(b).clicked() {
+                    self.edit(Op::Tag { on: !on, rel: rel.clone(), name: n });
+                }
+            }
+        });
+        ui.add_space(6.0);
+        if ui.add(Button::new(RichText::new("done").size(18.0)).min_size(vec2(ui.available_width(), 48.0))).clicked() {
+            self.tag_modal = false;
+        }
+    }
+
     fn player_bar(&mut self, ui: &mut Ui) {
         let player = self.player.clone();
         let mut p = player.borrow_mut();
@@ -290,22 +316,19 @@ impl App {
             if now_playing(ui, &mut p, Some(time)) {
                 self.fps = if self.fps.is_some() { None } else { Some((0.0, 0.0)) };
             }
-            let (mut share, mut bpm) = (false, false);
+            let mut share = false;
             ui.horizontal(|ui| {
                 controls(ui, &mut p, 22.0, vec2(56.0, 40.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(40.0, 40.0));
                     share = self.can_share && ui.add(b("share")).clicked();
-                    bpm = ui.add(b("bpm")).clicked();
+                    self.tag_modal |= ui.add(b("tag")).clicked();
                     if ui.add(b("⬇")).clicked() {
                         p.download();
                     }
                 });
             });
             drop(p);
-            if bpm {
-                self.analyze(&ui.ctx().clone());
-            }
             if share {
                 self.share();
             }
@@ -682,6 +705,12 @@ impl eframe::App for App {
                 egui::Frame::popup(ui.style()).show(ui, |ui| ui.add(Label::new(RichText::new(msg).monospace()).wrap_mode(egui::TextWrapMode::Extend)));
             });
             ui.ctx().request_repaint();
+        }
+        if self.tag_modal {
+            let m = egui::Modal::new("tag".into()).show(ui.ctx(), |ui| self.tag_buttons(ui));
+            if m.should_close() {
+                self.tag_modal = false;
+            }
         }
         if self.help {
             let m = egui::Modal::new("help".into()).show(ui.ctx(), |ui| {
