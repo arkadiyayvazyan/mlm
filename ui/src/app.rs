@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use eframe::egui::{
     self, pos2, text::LayoutJob, vec2, Align, Align2, Button, Color32, CornerRadius, FontId, Key, Label, Layout,
-    Modifiers, Painter, Rect, RichText, ScrollArea, Sense, TextEdit, TextFormat, Ui, Vec2,
+    DragValue, Modifiers, Painter, Rect, RichText, ScrollArea, Sense, TextEdit, TextFormat, Ui, Vec2,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -42,7 +42,9 @@ pub struct App {
     off: Offline,
     last_flush: f64, // egui time of the last retry of queued tag edits
     gen: u64,        // bumped whenever tracks or tags change: the filtered + sorted list is rebuilt only then
-    list_key: (String, Option<(usize, bool)>, u64), // (query, sort, gen) the cached list was built for
+    bpm: Option<(u32, u32)>, // BPM filter: center, ± range (hold the bpm column to open)
+    tags_open: bool,
+    list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, u64), // (query, sort, bpm, gen) the cached list was built for
     list_idx: Vec<usize>, // that list, as indices into `tracks`
     fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
 }
@@ -98,7 +100,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: None, tags_open: false, list_key: (String::new(), None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -323,14 +325,19 @@ impl App {
     }
 
     fn list(&mut self, ui: &mut Ui) {
-        // filter + sort only when the query, sort or data changed: every frame costs too much on a phone
-        let key = (self.q.clone(), self.sort, self.gen);
+        let narrow = ui.available_width() < NARROW;
+        if !narrow {
+            self.header(ui, false); // phones: in the bottom panel, under the thumb
+        }
+        // filter + sort only when the query, sort, BPM filter or data changed: every frame costs too much on a phone
+        let key = (self.q.clone(), self.sort, self.bpm, self.gen);
         if key != self.list_key {
             let q = self.q.trim().to_lowercase();
             let mut idx: Vec<usize> = (0..self.tracks.len())
                 .filter(|&i| {
                     let t = &self.tracks[i];
-                    q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q)
+                    self.bpm.is_none_or(|(c, r)| t.bpm > 0 && t.bpm.abs_diff(c) <= r)
+                        && (q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q))
                 })
                 .collect();
             let tr = &self.tracks;
@@ -350,23 +357,7 @@ impl App {
         }
         let list: Vec<&Track> = self.list_idx.iter().map(|&i| &self.tracks[i]).collect();
         let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color()); // one step brighter than egui defaults: easier to read
-        let narrow = ui.available_width() < NARROW;
-        let (row_h, hdr_h) = if narrow { (52.0, 36.0) } else { (ROW, ROW) };
-        // header: click a column to sort by it, again to reverse; on phones just four equal buttons
-        let (hdr, _) = ui.allocate_exact_size(vec2(ui.available_width(), hdr_h), Sense::hover());
-        let slots = if narrow { [0.0, 1.0, 2.0, 3.0, 4.0].map(|k| (16.0 + k * (hdr.width() - 32.0) / 5.0, (hdr.width() - 32.0) / 5.0)) } else { cols(hdr.width()) };
-        for (i, (x, cw)) in slots.into_iter().enumerate() {
-            let c = Rect::from_min_size(pos2(hdr.left() + x, hdr.top()), vec2(cw, hdr_h));
-            let r = ui.interact(c, ui.id().with(("sort", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-            let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
-            let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
-            let (at, align) = if i < 2 || narrow { (c.left_center(), Align2::LEFT_CENTER) } else { (c.right_center(), Align2::RIGHT_CENTER) };
-            let color = if r.hovered() || arrow != "" { text } else { weak };
-            ui.painter().with_clip_rect(c).text(at, align, label, FontId::proportional(13.0), color);
-            if r.clicked() {
-                self.sort = match self.sort { Some((j, d)) if j == i => Some((i, !d)), _ => Some((i, false)) };
-            }
-        }
+        let row_h = if narrow { 52.0 } else { ROW };
         let now_id = self.player.borrow().track().map(|t| t.id);
         let mut sa = ScrollArea::vertical().auto_shrink(false);
         // keep the playing row on screen when it changes (j/k, auto-advance); no-op when already visible
@@ -456,6 +447,56 @@ impl App {
                 self.player.borrow_mut().play(queue, i);
             } else {
                 *self.note.borrow_mut() = Some("not on this device: hold a track (right-click on desktop) at home to download it".into());
+            }
+        }
+    }
+
+    /// Filter row while a BPM filter is on: center and ± range, − / + for thumbs, drag or tap the number for big jumps.
+    fn bpm_panel(&mut self, ui: &mut Ui) {
+        let Some((c, r)) = &mut self.bpm else { return };
+        let mut off = false;
+        ui.horizontal(|ui| {
+            let h = if ui.available_width() < NARROW { 40.0 } else { 0.0 };
+            if h > 0.0 {
+                ui.spacing_mut().interact_size.y = h;
+                ui.spacing_mut().item_spacing.x = 4.0; // fits a 360 pt phone
+            }
+            let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(h, h));
+            off = ui.add(b("✕ bpm")).on_hover_text("BPM filter off").clicked();
+            if ui.add(b("−")).clicked() { *c = c.saturating_sub(1).max(1) }
+            ui.add(DragValue::new(c).range(1..=300));
+            if ui.add(b("+")).clicked() { *c = (*c + 1).min(300) }
+            ui.label("±");
+            if ui.add(b("−")).clicked() { *r = r.saturating_sub(1) }
+            ui.add(DragValue::new(r).range(0..=50));
+            if ui.add(b("+")).clicked() { *r = (*r + 1).min(50) }
+        });
+        if off {
+            self.bpm = None;
+        }
+    }
+
+    /// Column header: click a column to sort by it, again to reverse; hold (right-click) bpm to filter by BPM.
+    /// On phones just five equal buttons.
+    fn header(&mut self, ui: &mut Ui, narrow: bool) {
+        let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color());
+        let hdr_h = if narrow { 40.0 } else { ROW };
+        let (hdr, _) = ui.allocate_exact_size(vec2(ui.available_width(), hdr_h), Sense::hover());
+        let slots = if narrow { [0.0, 1.0, 2.0, 3.0, 4.0].map(|k| (16.0 + k * (hdr.width() - 32.0) / 5.0, (hdr.width() - 32.0) / 5.0)) } else { cols(hdr.width()) };
+        for (i, (x, cw)) in slots.into_iter().enumerate() {
+            let c = Rect::from_min_size(pos2(hdr.left() + x, hdr.top()), vec2(cw, hdr_h));
+            let r = ui.interact(c, ui.id().with(("sort", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
+            let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
+            let (at, align) = if i < 2 || narrow { (c.left_center(), Align2::LEFT_CENTER) } else { (c.right_center(), Align2::RIGHT_CENTER) };
+            let color = if r.hovered() || arrow != "" || (i == 3 && self.bpm.is_some()) { text } else { weak };
+            ui.painter().with_clip_rect(c).text(at, align, label, FontId::proportional(13.0), color);
+            if r.clicked() {
+                self.sort = match self.sort { Some((j, d)) if j == i => Some((i, !d)), _ => Some((i, false)) };
+            }
+            if i == 3 && r.secondary_clicked() && self.bpm.is_none() {
+                let now = self.player.borrow().track().map_or(0, |t| t.bpm); // start around the playing track
+                self.bpm = Some((if now > 0 { now } else { 120 }, 4));
             }
         }
     }
@@ -650,12 +691,10 @@ impl eframe::App for App {
             });
         }
         self.keys(&ui.ctx().clone());
-        egui::Panel::top("search").show(ui, |ui| {
-            ui.add_space(8.0);
-            let hint = format!("search {} tracks", self.tracks.len());
-            let h = if ui.available_width() < NARROW { 36.0 } else { 0.0 }; // thumb-sized on phones
-            ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
-            ui.collapsing("tags", |ui| self.tags_panel(ui));
+        egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
+        // search, tags, filters and (on phones) sorting sit just above the player: all in thumb reach
+        egui::Panel::bottom("search").show(ui, |ui| {
+            ui.add_space(4.0);
             if self.off.unreachable.get() {
                 let n = self.off.pending.len();
                 let queued = if n > 0 { format!(" · {n} tag change{} waiting to sync", if n == 1 { "" } else { "s" }) } else { String::new() };
@@ -670,8 +709,26 @@ impl eframe::App for App {
                     *self.install.borrow_mut() = None;
                 }
             }
+            if self.tags_open {
+                self.tags_panel(ui);
+            }
+            self.bpm_panel(ui);
+            let narrow = ui.available_width() < NARROW;
+            if narrow {
+                self.header(ui, true);
+            }
+            let hint = format!("search {} tracks", self.tracks.len());
+            let h = if narrow { 36.0 } else { 0.0 }; // thumb-sized on phones
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(Button::new("tags").selected(self.tags_open).min_size(vec2(56.0, h))).clicked() {
+                        self.tags_open = !self.tags_open;
+                    }
+                    ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
+                });
+            });
+            ui.add_space(4.0);
         });
-        egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
         egui::CentralPanel::default().show(ui, |ui| self.list(ui));
         if let Some((dt, cpu)) = &mut self.fps {
             // smoothed over ~20 frames; repaint continuously so the number is the real frame rate
@@ -688,7 +745,7 @@ impl eframe::App for App {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
+                          "? — this help", "hold (right-click) the bpm column — filter by BPM ± range", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");
