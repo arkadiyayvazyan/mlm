@@ -47,6 +47,8 @@ pub struct App {
     tags_open: bool,
     search_open: bool,
     focus_search: bool, // the search field takes focus once it's drawn
+    new_tag_open: bool, // hold the tags button or press #
+    focus_new_tag: bool,
     // (query, sort, bpm, offline copies when filtering on them, gen) the cached list was built for
     list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, Option<usize>, u64),
     list_idx: Vec<usize>, // that list, as indices into `tracks`
@@ -105,7 +107,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
             analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, tags_open: false, search_open: false, focus_search: false, list_key: (String::new(), None, None, None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, tags_open: false, search_open: false, focus_search: false, new_tag_open: false, focus_new_tag: false, list_key: (String::new(), None, None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -206,7 +208,7 @@ impl App {
         share_now(f, t.title, self.note.clone());
     }
 
-    /// vim-style: space = play/pause, j/k = next/prev, h/l = -/+ 1 min, ? = help, tag keys toggle tags;
+    /// vim-style: space = play/pause, j/k = next/prev, h/l = -/+ 1 min, ? = help, / = search, # = new tag, tag keys toggle tags;
     /// ctrl+d = download, ctrl+a = analyze BPM (the browser's bookmark / select-all are cancelled in main.rs).
     fn keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
@@ -236,6 +238,7 @@ impl App {
                 "l" => p.skip(60.0),
                 "?" => self.help = !self.help,
                 "/" => (self.search_open, self.focus_search) = (true, true),
+                "#" => (self.new_tag_open, self.focus_new_tag) = (true, true),
                 _ => {
                     drop(p);
                     let name = self.tags.keys.iter().find(|(_, v)| **v == k).map(|(n, _)| n.clone());
@@ -252,29 +255,9 @@ impl App {
         let now = self.now_rel();
         let narrow = ui.available_width() < NARROW;
         let h = if narrow { 36.0 } else { 0.0 }; // thumb-sized tags on phones
-        // right-aligned, in thumb reach; right-to-left adds the widgets in reverse: reads tags … new tag, key, ➕
+        // right-aligned, in thumb reach, wrapping from the right (newest tags first)
         // sized to its rows: in the full available rect a wrapping layout takes the panel's whole height
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 0.0), Layout::right_to_left(Align::Min).with_main_wrap(true), |ui| {
-            if !self.err.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, &self.err);
-            }
-            let add = ui.button(label(narrow, "➕", "add")).clicked();
-            let b = ui.add(TextEdit::singleline(&mut self.new_key).hint_text("key").char_limit(1).desired_width(30.0));
-            let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(100.0));
-            if a.changed() || b.changed() {
-                self.err.clear();
-            }
-            let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter));
-            if add || enter {
-                match self.tags.add(&self.new_name, &self.new_key) {
-                    Ok(()) => {
-                        self.color_new_tags(); // queues the new tag's Define (key + hue)
-                        self.new_name.clear();
-                        self.new_key.clear();
-                    }
-                    Err(e) => self.err = e,
-                }
-            }
             for (n, k) in self.tags.keys.clone().into_iter().rev() {
                 let on = now.as_ref().is_some_and(|r| self.tags.has(r, &n));
                 // always full pastel; a bright outline marks tags on the playing track
@@ -290,6 +273,38 @@ impl App {
                 }
             }
         });
+    }
+
+    /// New tag: name, key, ➕ (or Enter); closes once the tag is added.
+    fn new_tag_panel(&mut self, ui: &mut Ui) {
+        let narrow = ui.available_width() < NARROW;
+        let h = if narrow { 40.0 } else { 0.0 };
+        ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let add = ui.add(Button::new(RichText::new(label(narrow, "➕", "➕ add")).size(15.0)).min_size(vec2(h, h))).clicked();
+            let b = ui.add(TextEdit::singleline(&mut self.new_key).hint_text("key").char_limit(1).desired_width(40.0).min_size(vec2(0.0, h)).vertical_align(Align::Center));
+            let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(140.0).min_size(vec2(0.0, h)).vertical_align(Align::Center));
+            if std::mem::take(&mut self.focus_new_tag) {
+                a.request_focus();
+            }
+            if a.changed() || b.changed() {
+                self.err.clear();
+            }
+            let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter));
+            if add || enter {
+                match self.tags.add(&self.new_name, &self.new_key) {
+                    Ok(()) => {
+                        self.color_new_tags(); // queues the new tag's Define (key + hue)
+                        self.new_name.clear();
+                        self.new_key.clear();
+                        self.new_tag_open = false;
+                    }
+                    Err(e) => self.err = e,
+                }
+            }
+            if !self.err.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, &self.err);
+            }
+        }));
     }
 
     fn player_bar(&mut self, ui: &mut Ui) {
@@ -795,8 +810,13 @@ impl eframe::App for App {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let b = |s: String, on: bool| Button::new(RichText::new(s).size(15.0)).selected(on).min_size(vec2(h, h));
-                    if ui.add(b(label(narrow, "🏷", "🏷 tags"), self.tags_open)).clicked() {
+                    let t = ui.add(b(label(narrow, "🏷", "🏷 tags"), self.tags_open)).on_hover_text("hold (right-click) or #: new tag");
+                    if t.clicked() {
                         self.tags_open = !self.tags_open;
+                    }
+                    if t.secondary_clicked() {
+                        self.new_tag_open = !self.new_tag_open;
+                        self.focus_new_tag = self.new_tag_open;
                     }
                     // lit while a query filters the list, even with the field hidden
                     if ui.add(b(label(narrow, "🔍", "🔍 search"), self.search_open || !self.q.is_empty())).clicked() {
@@ -816,6 +836,11 @@ impl eframe::App for App {
         egui::Panel::bottom("tags_pane").resizable(false).show_collapsible(ui, &mut { self.tags_open }, |ui| {
             ui.add_space(4.0);
             self.tags_panel(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("new_tag_pane").resizable(false).show_collapsible(ui, &mut { self.new_tag_open }, |ui| {
+            ui.add_space(4.0);
+            self.new_tag_panel(ui);
             ui.add_space(4.0);
         });
         // search at the top: at the bottom the phone keyboard would cover it
@@ -858,7 +883,7 @@ impl eframe::App for App {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "? — this help", "/ — search", "hold (right-click) the bpm column — filter by BPM ± range", "tap the time (0:42 / 5:10) — frame-rate readout"] {
+                          "? — this help", "/ — search", "# — new tag", "hold (right-click) the bpm column — filter by BPM ± range", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");
