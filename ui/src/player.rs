@@ -347,6 +347,11 @@ fn new_ctx(rate: u32, sab: &SharedArrayBuffer, out: &HtmlAudioElement) -> AudioC
     if rate > 0 {
         o.set_sample_rate(rate as f32);
     }
+    // no output device of its own (Chrome 110+; ignored elsewhere): `out` is the only stream, and a Web Audio
+    // stream on Bluetooth is what Chrome on Android stutters when the app goes to the background
+    let none = Object::new();
+    let _ = Reflect::set(&none, &"type".into(), &"none".into());
+    let _ = Reflect::set(&o, &"sinkId".into(), &none);
     let ctx = AudioContext::new_with_context_options(&o).unwrap();
     let dest = ctx.create_media_stream_destination().unwrap();
     out.set_src_object(Some(&dest.stream()));
