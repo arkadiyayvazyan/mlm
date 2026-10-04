@@ -267,14 +267,15 @@ fn yt_url(u: &str) -> bool {
     !u.contains(char::is_whitespace) && matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be")
 }
 
-/// One of the progress lines `ytdl` has yt-dlp print, as (progress 0..1, stage, title once known): the download
-/// fills the first half of the bar, the MP3 conversion most of the rest.
-fn ytdl_progress(line: &str) -> Option<(f32, &'static str, Option<&str>)> {
+/// One of the progress lines `ytdl` has yt-dlp print, as (progress 0..1, stage, the track's title and length in
+/// seconds once known): the download fills the first half of the bar, the MP3 conversion most of the rest.
+fn ytdl_progress(line: &str) -> Option<(f32, &'static str, Option<(&str, f32)>)> {
     let l = line.trim().strip_prefix("mlm ")?;
     if let Some(l) = l.strip_prefix("dl ") {
-        let (pct, title) = l.trim_start().split_once(' ').unwrap_or((l.trim(), ""));
-        let pct: f32 = pct.trim_end_matches('%').parse().ok()?; // "Unknown %" when the size isn't known: no news
-        return Some((pct.clamp(0.0, 100.0) / 200.0, "downloading", Some(title.trim()).filter(|t| !t.is_empty())));
+        let mut part = l.trim_start().splitn(3, ' ');
+        let pct: f32 = part.next()?.trim_end_matches('%').parse().ok()?; // "Unknown %" when the size isn't known: no news
+        let secs = part.next()?.parse().unwrap_or(0.0); // "NA" for a live stream
+        return Some((pct.clamp(0.0, 100.0) / 200.0, "downloading", Some((part.next()?.trim(), secs))));
     }
     match l.strip_prefix("pp ")? {
         "ExtractAudio started" => Some((0.5, "converting to MP3", None)),
@@ -309,7 +310,7 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
             // downloaded; add %(id)s back (or a counter) if that ever bites
             .args(["-o", "%(artist&{} - |)s%(track,title)s.%(ext)s"])
             // progress as lines `ytdl_progress` reads, among yt-dlp's own chatter on stdout
-            .args(["--newline", "--progress-template", "download:mlm dl %(progress._percent_str)s %(info.artist&{} - |)s%(info.track,info.title)s"])
+            .args(["--newline", "--progress-template", "download:mlm dl %(progress._percent_str)s %(info.duration)s %(info.artist&{} - |)s%(info.track,info.title)s"])
             .args(["--progress-template", "postprocess:mlm pp %(progress.postprocessor)s %(progress.status)s"])
             .args(["--", &url])
             .stdout(Stdio::piped())
@@ -322,16 +323,33 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
             let _ = stderr.read_to_string(&mut s);
             s
         });
-        for line in std::io::BufReader::new(child.stdout.take().unwrap()).split(b'\n').map_while(Result::ok) {
-            if let Some((p, stage, title)) = ytdl_progress(&String::from_utf8_lossy(&line)) {
-                job.set(|j| {
-                    (j.progress, j.text) = (p, stage.into());
-                    if let Some(t) = title {
-                        j.name = t.into();
-                    }
-                });
+        let (mut secs, over) = (0.0, std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|s| {
+            for line in std::io::BufReader::new(child.stdout.take().unwrap()).split(b'\n').map_while(Result::ok) {
+                let line = String::from_utf8_lossy(&line);
+                if let Some((p, stage, track)) = ytdl_progress(&line) {
+                    job.set(|j| {
+                        (j.progress, j.text) = (p, stage.into());
+                        if let Some((title, len)) = track {
+                            (j.name, secs) = (title.into(), len);
+                        }
+                    });
+                } else if let Some(mp3) = line.trim().strip_prefix("[ExtractAudio] Destination: ").filter(|_| secs > 0.0) {
+                    // yt-dlp passes on nothing from ffmpeg, and converting is the slow part: watch the MP3 grow
+                    // towards its size at 320 kbps instead
+                    let (mp3, bytes, over) = (PathBuf::from(mp3), secs * 40_000.0, &over);
+                    s.spawn(move || {
+                        while !over.load(Ordering::Relaxed) {
+                            if let Ok(m) = std::fs::metadata(&mp3) {
+                                job.set(|j| j.progress = 0.5 + 0.4 * (m.len() as f32 / bytes).min(1.0));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                        }
+                    });
+                }
             }
-        }
+            over.store(true, Ordering::Relaxed);
+        });
         let (ok, err) = (child.wait().is_ok_and(|s| s.success()), err.join().unwrap_or_default());
         if !ok {
             return Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp failed").to_owned());
@@ -391,10 +409,11 @@ mod tests {
 
     #[test]
     fn reads_ytdl_progress_lines() {
-        assert_eq!(ytdl_progress("mlm dl   1.2% Me at the zoo"), Some((0.006, "downloading", Some("Me at the zoo"))));
-        assert_eq!(ytdl_progress("mlm dl 100.0% A - B\r"), Some((0.5, "downloading", Some("A - B"))));
-        assert_eq!(ytdl_progress("mlm dl 50%"), Some((0.25, "downloading", None)));
-        assert_eq!(ytdl_progress("mlm dl Unknown % A - B"), None);
+        assert_eq!(ytdl_progress("mlm dl   1.2% 19 Me at the zoo"), Some((0.006, "downloading", Some(("Me at the zoo", 19.0)))));
+        assert_eq!(ytdl_progress("mlm dl 100.0% 125.5 A - B\r"), Some((0.5, "downloading", Some(("A - B", 125.5)))));
+        assert_eq!(ytdl_progress("mlm dl 50% NA Live set"), Some((0.25, "downloading", Some(("Live set", 0.0)))));
+        assert_eq!(ytdl_progress("mlm dl Unknown % 19 A - B"), None);
+        assert_eq!(ytdl_progress("mlm dl 50%"), None);
         assert_eq!(ytdl_progress("mlm pp ExtractAudio started"), Some((0.5, "converting to MP3", None)));
         assert_eq!(ytdl_progress("mlm pp ExtractAudio finished"), Some((0.9, "adding artwork and tags", None)));
         assert_eq!(ytdl_progress("mlm pp MoveFiles finished"), None);
