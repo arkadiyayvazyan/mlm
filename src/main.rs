@@ -79,6 +79,7 @@ async fn main() {
         .route("/api/tags/ops", post(tags_ops))
         // ponytail: temporary, the UI's dropout probe logs here (journalctl -u mlm)
         .route("/api/log", post(|body: String| async move { eprintln!("client: {body}"); StatusCode::NO_CONTENT }))
+        .route("/api/ytdl", post(ytdl))
         .route("/api/rescan", post(|State(app): State<App>| async move { app.rescan(); StatusCode::ACCEPTED }))
         .with_state(app);
 
@@ -188,6 +189,56 @@ async fn analyze(State(app): State<App>, Path(id): Path<u64>) -> Response {
     }
 }
 
+/// Only YouTube / YouTube Music links reach yt-dlp, which would fetch from a thousand other sites too.
+fn yt_url(u: &str) -> bool {
+    let Some(rest) = u.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !u.contains(char::is_whitespace) && matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be")
+}
+
+/// Download a YouTube link (the request body) as a 320 kbps MP3 with square cover art into `MLM_DIR/ytdl/` and
+/// index it; answers with the new track's `rel`. Needs yt-dlp, ffmpeg and bun on PATH (`make ytdl-deps`).
+async fn ytdl(State(app): State<App>, url: String) -> Response {
+    let url = url.trim().to_owned();
+    if !yt_url(&url) {
+        return (StatusCode::BAD_REQUEST, "not a YouTube link").into_response();
+    }
+    // download + scan in one blocking task: it finishes (and the track is indexed) even if the phone hangs up
+    let r = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let out = std::process::Command::new("yt-dlp")
+            .args(["--js-runtimes", "bun", "--no-playlist", "--playlist-items", "1"])
+            .arg("--no-mtime") // "added" is the download, not the upload
+            .args(["-x", "--audio-format", "mp3", "--audio-quality", "320K"])
+            .args(["--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg"])
+            .args(["--ppa", r#"ThumbnailsConvertor+ffmpeg_o:-c:v mjpeg -vf crop="'if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'""#])
+            // intermediate files stay out of the library: a concurrent scan would index a half-written .m4a
+            .arg("-P").arg(format!("home:{}", app.dir.join("ytdl").display()))
+            .arg("-P").arg(format!("temp:{}", std::env::temp_dir().join("mlm-ytdl").display()))
+            // "Artist - Track" when YouTube knows them, else the video title; never the video id.
+            // ponytail: two videos with the same artist + title share a filename, the second counts as already
+            // downloaded; add %(id)s back (or a counter) if that ever bites
+            .args(["-o", "%(artist&{} - |)s%(track,title)s.%(ext)s"])
+            .args(["--print", "after_move:filepath", "--", &url])
+            .output()
+            .map_err(|e| format!("yt-dlp: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp failed").to_owned());
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or_default().trim());
+        let name = path.file_name().ok_or("yt-dlp printed no file")?.to_string_lossy().into_owned();
+        let t = library::scan(&app.dir, &app.cache);
+        *app.tracks.write().unwrap() = Arc::new(t);
+        Ok(format!("ytdl/{name}"))
+    })
+    .await
+    .unwrap();
+    match r {
+        Ok(rel) => rel.into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
 /// The original file, untouched (ctrl+d in the UI); the browser names it via the anchor's `download`.
 async fn file(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Response {
     match app.tracks().iter().find(|t| t.id == id) {
@@ -230,4 +281,21 @@ fn parse_range(headers: &HeaderMap, total: u64) -> Option<(u64, u64)> {
         (None, Some(n)) => (total.saturating_sub(n), total - 1),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::yt_url;
+
+    #[test]
+    fn only_youtube_links_pass() {
+        for ok in ["https://www.youtube.com/watch?v=abc", "https://youtube.com/watch?v=abc", "https://m.youtube.com/watch?v=abc",
+                   "https://music.youtube.com/watch?v=abc&si=x", "https://youtu.be/abc?t=1"] {
+            assert!(yt_url(ok), "{ok}");
+        }
+        for bad in ["http://www.youtube.com/watch?v=abc", "https://youtube.com.evil.com/watch?v=abc", "https://youtu.be@evil.com/x",
+                    "https://evil.com/?u=https://youtu.be/abc", "--exec rm", "https://youtu.be/abc --exec rm", "youtu.be/abc", ""] {
+            assert!(!yt_url(bad), "{bad}");
+        }
+    }
 }

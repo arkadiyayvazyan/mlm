@@ -34,6 +34,7 @@ pub struct App {
     view: (f32, f32),      // list scroll offset and height as of last frame
     sort: Option<(usize, bool)>, // column, descending; None = library order
     analyzed: Rc<RefCell<Option<(u64, Result<u32, String>)>>>, // ctrl+a result lands here
+    ytdl: Rc<RefCell<Option<Result<String, String>>>>, // YouTube download result lands here: the new track's rel
     status: Option<(String, f64)>, // message and the egui time it disappears at
     note: Rc<RefCell<Option<String>>>, // status messages from async work (share)
     can_share: bool,                   // the browser can share files (Android / iOS share sheet)
@@ -56,16 +57,23 @@ async fn get_json<T: serde::de::DeserializeOwned>(url: &str, unreachable: &std::
     serde_json::from_str(&JsFuture::from(res.text().ok()?).await.ok()?.as_string()?).ok()
 }
 
+/// Fetch the track and tag lists into `inbox`; a `reload` that fails leaves the lists on screen alone.
+fn load(inbox: &Rc<RefCell<Option<(Vec<Track>, Tags)>>>, ctx: &egui::Context, unreachable: &Rc<std::cell::Cell<bool>>, reload: bool) {
+    let (ib, ctx, unreachable) = (inbox.clone(), ctx.clone(), unreachable.clone());
+    spawn_local(async move {
+        let (t, g) = (get_json("/api/tracks", &unreachable).await, get_json("/api/tags", &unreachable).await);
+        if !reload || (t.is_some() && g.is_some()) {
+            *ib.borrow_mut() = Some((t.unwrap_or_default(), g.unwrap_or_default()));
+        }
+        ctx.request_repaint();
+    });
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let inbox = Rc::new(RefCell::new(None));
         let off = Offline::new(&cc.egui_ctx);
-        let (ib, ctx, unreachable) = (inbox.clone(), cc.egui_ctx.clone(), off.unreachable.clone());
-        spawn_local(async move {
-            let (t, g) = (get_json("/api/tracks", &unreachable).await, get_json("/api/tags", &unreachable).await);
-            *ib.borrow_mut() = Some((t.unwrap_or_default(), g.unwrap_or_default()));
-            ctx.request_repaint();
-        });
+        load(&inbox, &cc.egui_ctx, &off.unreachable, false);
         // the scheduler runs off a timer, not the frame loop: egui doesn't paint while the tab is hidden
         let player = Rc::new(RefCell::new(Player::new()));
         let p = player.clone();
@@ -97,7 +105,7 @@ impl App {
         Self {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
-            analyzed: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
+            analyzed: Rc::default(), ytdl: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
             off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
@@ -148,6 +156,25 @@ impl App {
             }
             .await;
             *inbox.borrow_mut() = Some((t.id, r.map_err(|e| e.as_string().unwrap_or_else(|| "network error".into()))));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Have the server download a YouTube link as an MP3 into the library's ytdl/ folder.
+    fn ytdl(&mut self, url: String, ctx: &egui::Context) {
+        self.status = Some(("downloading…".into(), f64::INFINITY));
+        let (inbox, ctx) = (self.ytdl.clone(), ctx.clone());
+        spawn_local(async move {
+            let r: Result<String, JsValue> = async {
+                let init = RequestInit::new();
+                init.set_method("POST");
+                init.set_body(&url.into());
+                let res: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str_and_init("/api/ytdl", &init)).await?.dyn_into()?;
+                let body = JsFuture::from(res.text()?).await?.as_string().unwrap_or_default();
+                if res.ok() { Ok(body) } else { Err(body.into()) }
+            }
+            .await;
+            *inbox.borrow_mut() = Some(r.map_err(|e| e.as_string().unwrap_or_else(|| "network error".into())));
             ctx.request_repaint();
         });
     }
@@ -638,6 +665,19 @@ impl eframe::App for App {
                 now + 5.0,
             ));
         }
+        if let Some(r) = self.ytdl.borrow_mut().take() {
+            self.status = Some((
+                match r {
+                    Ok(rel) => {
+                        load(&self.inbox, ui.ctx(), &self.off.unreachable, true);
+                        self.q = rel; // the list shows just the new track: play, analyze, tag
+                        format!("downloaded {}", self.q)
+                    }
+                    Err(e) => format!("download failed: {e}"),
+                },
+                now + 5.0,
+            ));
+        }
         if let Some(msg) = self.note.borrow_mut().take() {
             self.status = (!msg.is_empty()).then_some((msg, now + 5.0));
         }
@@ -654,7 +694,15 @@ impl eframe::App for App {
             ui.add_space(8.0);
             let hint = format!("search {} tracks", self.tracks.len());
             let h = if ui.available_width() < NARROW { 36.0 } else { 0.0 }; // thumb-sized on phones
-            ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
+            let before = self.q.len();
+            let r = ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
+            // a YouTube link pasted here (or typed, then enter) is a download, not a search
+            let link = self.q.trim().starts_with("https://") && ["youtube.com/", "youtu.be/"].iter().any(|h| self.q.contains(h));
+            let pasted = r.changed() && (self.q.len() > before + 1 || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))));
+            if link && (pasted || r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
+                let url = std::mem::take(&mut self.q).trim().to_owned();
+                self.ytdl(url, ui.ctx());
+            }
             ui.collapsing("tags", |ui| self.tags_panel(ui));
             if self.off.unreachable.get() {
                 let n = self.off.pending.len();
@@ -688,7 +736,7 @@ impl eframe::App for App {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
+                          "paste a YouTube link into search — download it as an MP3 into ytdl/", "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");

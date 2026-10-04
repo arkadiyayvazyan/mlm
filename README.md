@@ -71,6 +71,14 @@ Env: `MLM_DIR` (music root), `MLM_ADDR` (default 0.0.0.0:8080), `MLM_CACHE` (ind
 `MLM_TAGS` (user tags JSON path, default `mlm-tags.json`).
 `POST /api/rescan` re-indexes; only files with a changed mtime are re-tagged.
 
+## YouTube
+
+Paste a YouTube or YouTube Music link into the search box (or type it and press enter): the server downloads it
+(`POST /api/ytdl`, body = the link) as a 320 kbps MP3 with title / artist tags and square cover art into
+`MLM_DIR/ytdl/`, named `Artist - Track.mp3` (or the video title), re-indexes, and the search shows the new track,
+ready to play, analyze and tag. It needs `yt-dlp`, `ffmpeg` and `bun` on the service's PATH: `make ytdl-deps`
+installs yt-dlp and links bun into `/usr/local/bin` on the Pi; rerun it to update yt-dlp when YouTube breaks it.
+
 ## Tags
 
 Open the **tags** panel under the search box to create a tag with a one-key shortcut. Pressing that
