@@ -30,8 +30,12 @@ pub struct App {
     new_key: String,
     err: String,
     help: bool,
-    shown_id: Option<u64>, // playing track as of last frame: scroll when it changes
+    shown_id: Option<u64>, // playing track as of last frame: the cursor follows when it changes
     view: (f32, f32),      // list scroll offset and height as of last frame
+    sel: Option<u64>,      // keyboard cursor: arrows move it without playing; otherwise it rides along with the playing track
+    step: i32,             // arrow presses this frame, down minus up
+    enter: bool,           // enter pressed this frame: play the cursor row
+    center: bool,          // scroll the cursor row to the middle of the list this frame
     sort: Option<(usize, bool)>, // column, descending; None = library order
     analyzed: Rc<RefCell<Option<(u64, Result<u32, String>)>>>, // ctrl+a result lands here
     ytdl: Rc<RefCell<Option<Result<String, String>>>>, // YouTube download result lands here: the new track's rel
@@ -90,12 +94,10 @@ impl App {
         }
         offer.forget();
         let mut media = crate::media::Media::new(&player);
-        let mut probe = None;
         let tick = Closure::<dyn FnMut()>::new(move || {
             let mut p = p.borrow_mut();
             p.tick();
             media.sync(&p);
-            p.probe(&mut probe);
         });
         web_sys::window()
             .unwrap()
@@ -104,7 +106,7 @@ impl App {
         tick.forget();
         Self {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
-            new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sort: None,
+            new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sel: None, step: 0, enter: false, center: false, sort: None,
             analyzed: Rc::default(), ytdl: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
             off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
         }
@@ -226,6 +228,7 @@ impl App {
     }
 
     /// vim-style: space = play/pause, j/k = next/prev, h/l = -/+ 1 min, ? = help, tag keys toggle tags;
+    /// up/down = move the cursor without playing, enter = play the cursor row (both applied in `list`);
     /// ctrl+d = download, ctrl+a = analyze BPM (the browser's bookmark / select-all are cancelled in main.rs).
     fn keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
@@ -238,6 +241,11 @@ impl App {
         if an {
             self.analyze(ctx);
         }
+        // read here, not in list(): by then a text field that took Enter has already given up focus
+        (self.step, self.enter) = ctx.input_mut(|i| {
+            let n = |i: &mut egui::InputState, k| i.count_and_consume_key(Modifiers::NONE, k) as i32; // counts key repeats
+            (n(i, Key::ArrowDown) - n(i, Key::ArrowUp), i.consume_key(Modifiers::NONE, Key::Enter))
+        });
         let texts: Vec<String> = ctx.input(|i| {
             if i.modifiers.alt || i.modifiers.command { return vec![] }
             i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect()
@@ -249,8 +257,10 @@ impl App {
                     ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space)); // not also a click on a focused button
                     p.toggle()
                 }
-                "j" => p.next(),
-                "k" => p.prev(),
+                "j" | "k" => {
+                    if k == "j" { p.next() } else { p.prev() }
+                    (self.sel, self.center) = (self.shown_id, true); // cursor back onto the playing track: list() follows it to the new one
+                }
                 "h" => p.skip(-60.0),
                 "l" => p.skip(60.0),
                 "?" => self.help = !self.help,
@@ -395,16 +405,30 @@ impl App {
             }
         }
         let now_id = self.player.borrow().track().map(|t| t.id);
-        let mut sa = ScrollArea::vertical().auto_shrink(false);
-        // keep the playing row on screen when it changes (j/k, auto-advance); no-op when already visible
+        // the cursor rides along with the playing track (j/k, auto-advance) unless the arrows moved it elsewhere
         if now_id != self.shown_id {
-            self.shown_id = now_id;
-            if let Some(k) = list.iter().position(|t| Some(t.id) == now_id) {
-                let (y, (off, h)) = (k as f32 * row_h, self.view);
-                if y < off { sa = sa.vertical_scroll_offset(y) } else if y + row_h > off + h { sa = sa.vertical_scroll_offset(y + row_h - h) }
+            if self.sel == self.shown_id {
+                (self.sel, self.center) = (now_id, true);
             }
+            self.shown_id = now_id;
         }
-        let hl = ui.visuals().widgets.hovered.weak_bg_fill;
+        let (off, h) = self.view;
+        // cursor row: looked up only on frames with a key press or a track change
+        let mut at = if self.step != 0 || self.enter || self.center { list.iter().position(|t| Some(t.id) == self.sel) } else { None };
+        if self.step != 0 && !list.is_empty() {
+            // no cursor in this list yet: start from the row in the middle of the view
+            let k = at.map_or(((off + h / 2.0) / row_h) as i32, |k| k as i32 + self.step).clamp(0, list.len() as i32 - 1) as usize;
+            (at, self.sel, self.center) = (Some(k), Some(list[k].id), true);
+        }
+        let mut sa = ScrollArea::vertical().auto_shrink(false);
+        // keyboard moves keep the cursor row in the middle of the list (egui clamps the offset at the far end)
+        if let (true, Some(k)) = (self.center, at) {
+            sa = sa.vertical_scroll_offset(((k as f32 + 0.5) * row_h - h / 2.0).max(0.0));
+        }
+        let play_sel = if self.enter { at } else { None };
+        (self.step, self.enter, self.center) = (0, false, false);
+        let (hl, cur) = (ui.visuals().widgets.hovered.weak_bg_fill, ui.visuals().selection.bg_fill);
+        let sel = self.sel;
         let (have, busy, offline) = (self.off.have.borrow(), self.off.busy.borrow(), self.off.unreachable.get());
         let mut hold = None;
         let out = sa.show_viewport(ui, |ui, vp| {
@@ -417,7 +441,9 @@ impl App {
             for (k, t) in list.iter().enumerate().take(b).skip(a) {
                 let row = Rect::from_min_size(top + vec2(0.0, k as f32 * row_h), vec2(w, row_h));
                 let r = ui.interact(row, ui.id().with(t.id), Sense::click());
-                if r.hovered() || Some(t.id) == now_id {
+                if Some(t.id) == sel {
+                    ui.painter().rect_filled(row, 0.0, cur);
+                } else if r.hovered() || Some(t.id) == now_id {
                     ui.painter().rect_filled(row, 0.0, hl);
                 }
                 if r.clicked() {
@@ -473,7 +499,8 @@ impl App {
         if let Some(k) = hold {
             self.off.toggle(list[k], self.note.clone());
         }
-        if let Some(k) = clicked {
+        if let Some(k) = clicked.or(play_sel) {
+            self.sel = Some(list[k].id);
             if !offline {
                 self.player.borrow_mut().play(list.into_iter().cloned().collect(), k);
             } else if have.contains(&list[k].id) {
@@ -734,7 +761,7 @@ impl eframe::App for App {
         if self.help {
             let m = egui::Modal::new("help".into()).show(ui.ctx(), |ui| {
                 ui.label(RichText::new("Keys").strong());
-                for l in ["space — play / pause", "j / k — next / previous track", "h / l — back / forward 1 min",
+                for l in ["space — play / pause", "j / k — next / previous track", "↑ / ↓ — move the highlight without playing", "enter — play the highlighted track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
                           "paste a YouTube link into search — download it as an MP3 into ytdl/", "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
