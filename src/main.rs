@@ -328,73 +328,87 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
         let app = a;
         let tmp = std::env::temp_dir().join("mlm-ytdl");
         let report = tmp.join(format!("{}.progress", job.id)); // ffmpeg's, while it converts
-        let mut child = std::process::Command::new("yt-dlp")
-            .args(["--js-runtimes", "bun", "--no-playlist", "--playlist-items", "1"])
-            .arg("--no-mtime") // "added" is the download, not the upload
-            .args(["-x", "--audio-format", "mp3", "--audio-quality", "320K"])
-            .args(["--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg"])
-            .args(["--ppa", r#"ThumbnailsConvertor+ffmpeg_o:-c:v mjpeg -vf crop="'if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'""#])
-            // intermediate files stay out of the library: a concurrent scan would index a half-written .m4a
-            .arg("-P").arg(format!("home:{}", app.dir.join("ytdl").display()))
-            .arg("-P").arg(format!("temp:{}", tmp.display()))
-            // yt-dlp shows nothing while ffmpeg converts, the slow part: have ffmpeg report how far it is, 10x a second
-            .arg("--ppa").arg(format!("ExtractAudio+ffmpeg:-progress '{}' -stats_period 0.1", report.display()))
-            // "Artist - Track" when YouTube knows them, else the video title; never the video id.
-            // ponytail: two videos with the same artist + title share a filename, the second counts as already
-            // downloaded; add %(id)s back (or a counter) if that ever bites
-            .args(["-o", "%(artist&{} - |)s%(track,title)s.%(ext)s"])
-            // what yt-dlp shows, a line at a time, for `ytdl_progress`; the download and post-processing lines in a
-            // shape that's easy to tell apart and carries the title
-            .args(["--newline", "--progress-template", "download:mlm dl %(info.duration)s\t%(info.artist&{} - |)s%(info.track,info.title)s\t%(progress._default_template)s"])
-            .args(["--progress-template", "postprocess:mlm pp %(progress.postprocessor)s %(progress.status)s"])
-            .args(["--", &url])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("yt-dlp: {e}"))?;
-        let mut stderr = child.stderr.take().unwrap();
-        let err = std::thread::spawn(move || {
-            let mut s = String::new(); // drained on the side: a full stderr pipe would stall yt-dlp
-            let _ = stderr.read_to_string(&mut s);
-            s
-        });
-        let (over, secs) = (std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicU32::new(0)); // the track's length, f32 bits
-        std::thread::scope(|s| {
-            // the conversion, from ffmpeg's report: the only stage yt-dlp's own lines don't cover
-            s.spawn(|| {
-                while !over.load(Ordering::Relaxed) {
-                    let len = f32::from_bits(secs.load(Ordering::Relaxed));
-                    if let Some(at) = ffmpeg_secs(&report).filter(|_| len > 0.0) {
-                        let part = (at / len).min(1.0);
+        let run = || -> Result<(), String> {
+            let mut child = std::process::Command::new("yt-dlp")
+                .args(["--js-runtimes", "bun", "--no-playlist", "--playlist-items", "1"])
+                .arg("--no-mtime") // "added" is the download, not the upload
+                .args(["-x", "--audio-format", "mp3", "--audio-quality", "320K"])
+                .args(["--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg"])
+                .args(["--ppa", r#"ThumbnailsConvertor+ffmpeg_o:-c:v mjpeg -vf crop="'if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'""#])
+                // intermediate files stay out of the library: a concurrent scan would index a half-written .m4a
+                .arg("-P").arg(format!("home:{}", app.dir.join("ytdl").display()))
+                .arg("-P").arg(format!("temp:{}", tmp.display()))
+                // yt-dlp shows nothing while ffmpeg converts, the slow part: have ffmpeg report how far it is, 10x a second
+                .arg("--ppa").arg(format!("ExtractAudio+ffmpeg:-progress '{}' -stats_period 0.1", report.display()))
+                // "Artist - Track" when YouTube knows them, else the video title; never the video id.
+                // ponytail: two videos with the same artist + title share a filename, the second counts as already
+                // downloaded; add %(id)s back (or a counter) if that ever bites
+                .args(["-o", "%(artist&{} - |)s%(track,title)s.%(ext)s"])
+                // what yt-dlp shows, a line at a time, for `ytdl_progress`; the download and post-processing lines in a
+                // shape that's easy to tell apart and carries the title
+                .args(["--newline", "--progress-template", "download:mlm dl %(info.duration)s\t%(info.artist&{} - |)s%(info.track,info.title)s\t%(progress._default_template)s"])
+                .args(["--progress-template", "postprocess:mlm pp %(progress.postprocessor)s %(progress.status)s"])
+                .args(["--", &url])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("yt-dlp: {e}"))?;
+            let mut stderr = child.stderr.take().unwrap();
+            let err = std::thread::spawn(move || {
+                let mut s = String::new(); // drained on the side: a full stderr pipe would stall yt-dlp
+                let _ = stderr.read_to_string(&mut s);
+                s
+            });
+            let (over, secs) = (std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicU32::new(0)); // the track's length, f32 bits
+            std::thread::scope(|s| {
+                // the conversion, from ffmpeg's report: the only stage yt-dlp's own lines don't cover
+                s.spawn(|| {
+                    while !over.load(Ordering::Relaxed) {
+                        let len = f32::from_bits(secs.load(Ordering::Relaxed));
+                        if let Some(at) = ffmpeg_secs(&report).filter(|_| len > 0.0) {
+                            let part = (at / len).min(1.0);
+                            job.set(|j| {
+                                if j.text.starts_with(CONVERTING) && 0.5 + 0.4 * part > j.progress {
+                                    (j.progress, j.text) = (0.5 + 0.4 * part, format!("{CONVERTING} {:.0}%", part * 100.0));
+                                }
+                            });
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                });
+                for line in std::io::BufReader::new(child.stdout.take().unwrap()).split(b'\n').map_while(Result::ok) {
+                    if let Some((p, stage, track)) = ytdl_progress(&String::from_utf8_lossy(&line)) {
                         job.set(|j| {
-                            if j.text.starts_with(CONVERTING) && 0.5 + 0.4 * part > j.progress {
-                                (j.progress, j.text) = (0.5 + 0.4 * part, format!("{CONVERTING} {:.0}%", part * 100.0));
+                            // a step in resolving the link: part of the way to where the download starts
+                            j.progress = j.progress.max(p.unwrap_or(j.progress + (0.2 - j.progress) * 0.15));
+                            j.text = stage;
+                            if let Some((title, len)) = track {
+                                j.name = title.into();
+                                secs.store(len.to_bits(), Ordering::Relaxed);
                             }
                         });
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+                over.store(true, Ordering::Relaxed);
             });
-            for line in std::io::BufReader::new(child.stdout.take().unwrap()).split(b'\n').map_while(Result::ok) {
-                if let Some((p, stage, track)) = ytdl_progress(&String::from_utf8_lossy(&line)) {
-                    job.set(|j| {
-                        // a step in resolving the link: part of the way to where the download starts
-                        j.progress = j.progress.max(p.unwrap_or(j.progress + (0.2 - j.progress) * 0.15));
-                        j.text = stage;
-                        if let Some((title, len)) = track {
-                            j.name = title.into();
-                            secs.store(len.to_bits(), Ordering::Relaxed);
-                        }
-                    });
-                }
+            let _ = std::fs::remove_file(&report);
+            let (ok, err) = (child.wait().is_ok_and(|s| s.success()), err.join().unwrap_or_default());
+            if !ok {
+                return Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp failed").to_owned());
             }
-            over.store(true, Ordering::Relaxed);
-        });
-        let _ = std::fs::remove_file(&report);
-        let (ok, err) = (child.wait().is_ok_and(|s| s.success()), err.join().unwrap_or_default());
-        if !ok {
-            return Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp failed").to_owned());
+            Ok(())
+        };
+        // now and then YouTube refuses the audio (403) of a link it has just resolved, and yt-dlp gives up at once;
+        // the next try usually gets it
+        let mut r = run();
+        for _ in 0..2 {
+            if !r.as_ref().is_err_and(|e| e.contains("HTTP Error 403")) {
+                break;
+            }
+            job.set(|j| (j.progress, j.text) = (0.0, "YouTube refused the download, trying again".into()));
+            r = run();
         }
+        r?;
         app.scan();
         Ok("downloaded".into())
     })
