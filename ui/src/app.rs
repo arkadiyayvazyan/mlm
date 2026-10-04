@@ -692,7 +692,7 @@ impl eframe::App for App {
             }
             self.jobs = jobs;
         }
-        if (!self.jobs.is_empty() || now < self.poll.1) && now - self.poll.0 > 0.5 {
+        if (!self.jobs.is_empty() || now < self.poll.1) && now - self.poll.0 > 0.25 {
             self.poll.0 = now;
             let (inbox, ctx, unreachable) = (self.jobs_in.clone(), ui.ctx().clone(), self.off.unreachable.clone());
             spawn_local(async move {
@@ -751,7 +751,9 @@ impl eframe::App for App {
                     if j.state == "failed" {
                         ui.colored_label(ui.visuals().error_fg_color, format!("{} — failed: {}", j.name, j.text));
                     } else {
-                        ui.add(egui::ProgressBar::new(j.progress).text(format!("{} — {}", j.name, j.text)));
+                        // glide between the polled values: the bar moves every frame, not four times a second
+                        let p = ui.ctx().animate_value_with_time(egui::Id::new(("job", j.id)), j.progress, 0.5);
+                        ui.add(egui::ProgressBar::new(p).text(format!("{} — {}", j.name, j.text)));
                     }
                 }
                 let queued = self.jobs.iter().filter(|j| j.state == "queued").count();

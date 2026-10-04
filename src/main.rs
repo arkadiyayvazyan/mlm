@@ -100,7 +100,7 @@ impl App {
             tokio::spawn(async move {
                 let _slot = app.slots.acquire().await.unwrap();
                 let (me, end) = (JobRef { jobs: app.jobs.clone(), id }, JobRef { jobs: app.jobs.clone(), id });
-                me.set(|j| (j.state, j.text) = ("running", "starting".into()));
+                me.set(|j| (j.state, j.text) = ("running", STARTING.into()));
                 let r = tokio::task::spawn_blocking(move || work(&me)).await.unwrap_or_else(|e| Err(e.to_string()));
                 end.set(|j| {
                     (j.state, j.text) = match r {
@@ -267,19 +267,25 @@ fn yt_url(u: &str) -> bool {
     !u.contains(char::is_whitespace) && matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be")
 }
 
+// a download's stages after "downloading", as shown in the UI
+const STARTING: &str = "starting";
+const CONVERTING: &str = "converting to MP3";
+const TAGGING: &str = "adding artwork and tags";
+
 /// One of the progress lines `ytdl` has yt-dlp print, as (progress 0..1, stage, the track's title and length in
-/// seconds once known): the download fills the first half of the bar, the MP3 conversion most of the rest.
+/// seconds once known). Of the bar, resolving the link is the first tenth, the download runs to the middle, the MP3
+/// conversion to nine tenths, tagging is the rest.
 fn ytdl_progress(line: &str) -> Option<(f32, &'static str, Option<(&str, f32)>)> {
     let l = line.trim().strip_prefix("mlm ")?;
     if let Some(l) = l.strip_prefix("dl ") {
         let mut part = l.trim_start().splitn(3, ' ');
         let pct: f32 = part.next()?.trim_end_matches('%').parse().ok()?; // "Unknown %" when the size isn't known: no news
         let secs = part.next()?.parse().unwrap_or(0.0); // "NA" for a live stream
-        return Some((pct.clamp(0.0, 100.0) / 200.0, "downloading", Some((part.next()?.trim(), secs))));
+        return Some((0.1 + pct.clamp(0.0, 100.0) / 250.0, "downloading", Some((part.next()?.trim(), secs))));
     }
     match l.strip_prefix("pp ")? {
-        "ExtractAudio started" => Some((0.5, "converting to MP3", None)),
-        "ExtractAudio finished" => Some((0.9, "adding artwork and tags", None)),
+        "ExtractAudio started" => Some((0.5, CONVERTING, None)),
+        "ExtractAudio finished" => Some((0.9, TAGGING, None)),
         _ => None,
     }
 }
@@ -323,8 +329,26 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
             let _ = stderr.read_to_string(&mut s);
             s
         });
-        let (mut secs, over) = (0.0, std::sync::atomic::AtomicBool::new(false));
+        let (over, mp3) = (std::sync::atomic::AtomicBool::new(false), Mutex::new(None::<(PathBuf, f32)>)); // the MP3 being written, its final size
+        let mut secs = 0.0;
         std::thread::scope(|s| {
+            // ten times a second, so the bar moves between yt-dlp's lines too
+            s.spawn(|| {
+                while !over.load(Ordering::Relaxed) {
+                    let written = mp3.lock().unwrap().as_ref().and_then(|(p, bytes)| Some(std::fs::metadata(p).ok()?.len() as f32 / bytes));
+                    job.set(|j| match (j.text.as_str(), written) {
+                        // no numbers while yt-dlp resolves the link (some 10 s) or tags the file: creep towards the stage's end
+                        (STARTING, _) => j.progress += (0.1 - j.progress) * 0.02,
+                        (TAGGING, _) => j.progress += (1.0 - j.progress) * 0.03,
+                        // yt-dlp passes on nothing from ffmpeg, and converting is the slow part: the MP3 growing
+                        // towards its size at 320 kbps is the progress. ffmpeg writes it a chunk a second: ease
+                        // towards each new size rather than jump
+                        (CONVERTING, Some(part)) => j.progress += (0.5 + 0.4 * part.min(1.0) - j.progress) * 0.15,
+                        _ => {}
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
             for line in std::io::BufReader::new(child.stdout.take().unwrap()).split(b'\n').map_while(Result::ok) {
                 let line = String::from_utf8_lossy(&line);
                 if let Some((p, stage, track)) = ytdl_progress(&line) {
@@ -334,18 +358,8 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
                             (j.name, secs) = (title.into(), len);
                         }
                     });
-                } else if let Some(mp3) = line.trim().strip_prefix("[ExtractAudio] Destination: ").filter(|_| secs > 0.0) {
-                    // yt-dlp passes on nothing from ffmpeg, and converting is the slow part: watch the MP3 grow
-                    // towards its size at 320 kbps instead
-                    let (mp3, bytes, over) = (PathBuf::from(mp3), secs * 40_000.0, &over);
-                    s.spawn(move || {
-                        while !over.load(Ordering::Relaxed) {
-                            if let Ok(m) = std::fs::metadata(&mp3) {
-                                job.set(|j| j.progress = 0.5 + 0.4 * (m.len() as f32 / bytes).min(1.0));
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(300));
-                        }
-                    });
+                } else if let Some(path) = line.trim().strip_prefix("[ExtractAudio] Destination: ").filter(|_| secs > 0.0) {
+                    *mp3.lock().unwrap() = Some((PathBuf::from(path), secs * 40_000.0));
                 }
             }
             over.store(true, Ordering::Relaxed);
@@ -409,9 +423,9 @@ mod tests {
 
     #[test]
     fn reads_ytdl_progress_lines() {
-        assert_eq!(ytdl_progress("mlm dl   1.2% 19 Me at the zoo"), Some((0.006, "downloading", Some(("Me at the zoo", 19.0)))));
-        assert_eq!(ytdl_progress("mlm dl 100.0% 125.5 A - B\r"), Some((0.5, "downloading", Some(("A - B", 125.5)))));
-        assert_eq!(ytdl_progress("mlm dl 50% NA Live set"), Some((0.25, "downloading", Some(("Live set", 0.0)))));
+        assert_eq!(ytdl_progress("mlm dl   1.2% 19 Me at the zoo"), Some((0.1 + 1.2 / 250.0, "downloading", Some(("Me at the zoo", 19.0)))));
+        assert_eq!(ytdl_progress("mlm dl 100.0% 125.5 A - B\r"), Some((0.1 + 100.0 / 250.0, "downloading", Some(("A - B", 125.5)))));
+        assert_eq!(ytdl_progress("mlm dl 50% NA Live set"), Some((0.1 + 50.0 / 250.0, "downloading", Some(("Live set", 0.0)))));
         assert_eq!(ytdl_progress("mlm dl Unknown % 19 A - B"), None);
         assert_eq!(ytdl_progress("mlm dl 50%"), None);
         assert_eq!(ytdl_progress("mlm pp ExtractAudio started"), Some((0.5, "converting to MP3", None)));
