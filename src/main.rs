@@ -100,7 +100,7 @@ impl App {
             tokio::spawn(async move {
                 let _slot = app.slots.acquire().await.unwrap();
                 let (me, end) = (JobRef { jobs: app.jobs.clone(), id }, JobRef { jobs: app.jobs.clone(), id });
-                me.set(|j| (j.state, j.text) = ("running", STARTING.into()));
+                me.set(|j| (j.state, j.text) = ("running", "starting".into()));
                 let r = tokio::task::spawn_blocking(move || work(&me)).await.unwrap_or_else(|e| Err(e.to_string()));
                 end.set(|j| {
                     (j.state, j.text) = match r {
@@ -267,27 +267,51 @@ fn yt_url(u: &str) -> bool {
     !u.contains(char::is_whitespace) && matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be")
 }
 
-// a download's stages after "downloading", as shown in the UI
-const STARTING: &str = "starting";
-const CONVERTING: &str = "converting to MP3";
-const TAGGING: &str = "adding artwork and tags";
+const CONVERTING: &str = "converting to MP3"; // the stage `ytdl` fills in from ffmpeg's report
 
-/// One of the progress lines `ytdl` has yt-dlp print, as (progress 0..1, stage, the track's title and length in
-/// seconds once known). Of the bar, resolving the link is the first tenth, the download runs to the middle, the MP3
-/// conversion to nine tenths, tagging is the rest.
-fn ytdl_progress(line: &str) -> Option<(f32, &'static str, Option<(&str, f32)>)> {
-    let l = line.trim().strip_prefix("mlm ")?;
-    if let Some(l) = l.strip_prefix("dl ") {
-        let mut part = l.trim_start().splitn(3, ' ');
-        let pct: f32 = part.next()?.trim_end_matches('%').parse().ok()?; // "Unknown %" when the size isn't known: no news
-        let secs = part.next()?.parse().unwrap_or(0.0); // "NA" for a live stream
-        return Some((0.1 + pct.clamp(0.0, 100.0) / 250.0, "downloading", Some((part.next()?.trim(), secs))));
+/// What a line of yt-dlp's output says about a download, as (progress 0..1, the stage to show, the track's title
+/// and length in seconds once known). Of the bar, resolving the link is the first fifth, the download runs to the
+/// middle, the MP3 conversion (`ffmpeg_secs`) to nine tenths, tagging is the rest. Resolving is a varying number
+/// of steps with no size of their own (None): `ytdl` moves each part of the way to the fifth.
+fn ytdl_progress(line: &str) -> Option<(Option<f32>, String, Option<(&str, f32)>)> {
+    let l = line.trim();
+    if let Some(l) = l.strip_prefix("mlm dl ") {
+        // tab-separated: length, title, and yt-dlp's own progress text, "24.5% of 2.03MiB at 7.45MiB/s ETA 00:00"
+        let mut part = l.split('\t');
+        let (secs, title) = (part.next()?.parse().unwrap_or(0.0), part.next()?.trim()); // "NA" seconds: a live stream
+        let shown = part.next()?.split_whitespace().collect::<Vec<_>>().join(" ");
+        let pct: f32 = shown.split('%').next()?.parse().ok()?; // no percentage when the size isn't known: no news
+        return Some((Some(0.2 + 0.3 * pct.clamp(0.0, 100.0) / 100.0), format!("downloading {shown}"), Some((title, secs))));
     }
-    match l.strip_prefix("pp ")? {
-        "ExtractAudio started" => Some((0.5, CONVERTING, None)),
-        "ExtractAudio finished" => Some((0.9, TAGGING, None)),
-        _ => None,
+    if let Some(pp) = l.strip_prefix("mlm pp ") {
+        let (p, stage) = match pp {
+            "ThumbnailsConvertor started" => (None, "preparing the artwork"),
+            "ExtractAudio started" => (Some(0.5), CONVERTING),
+            "Metadata started" => (Some(0.9), "adding tags"),
+            "EmbedThumbnail started" => (Some(0.94), "adding artwork"),
+            "MoveFiles started" => (Some(0.98), "moving into the library"),
+            _ => return None,
+        };
+        return Some((p, stage.into(), None));
     }
+    // resolving the link: "[youtube] <id>: Downloading webpage", "[info] <id>: Downloading 1 format(s): 251", ...
+    if !["[youtube", "[info]", "[jsc"].iter().any(|tag| l.starts_with(tag)) {
+        return None;
+    }
+    let msg = l.split_once("] ")?.1;
+    let msg = msg.split_once(": ").filter(|(id, _)| !id.contains(' ')).map_or(msg, |(_, m)| m); // without the video id
+    Some((None, msg.split(':').next()?.trim().trim_end_matches(" to").into(), None)) // without the URL or path after a colon
+}
+
+/// How many seconds of audio ffmpeg has converted, from the tail of its `-progress` report.
+fn ffmpeg_secs(report: &std::path::Path) -> Option<f32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(report).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(512))).ok()?; // a block of the report is some 250 bytes
+    let mut tail = String::new();
+    f.read_to_string(&mut tail).ok()?;
+    tail.lines().rev().find_map(|l| l.strip_prefix("out_time_us=")?.parse::<f32>().ok()).map(|us| us / 1e6)
 }
 
 /// A job: download a YouTube link (the request body) as a 320 kbps MP3 with square cover art into `MLM_DIR/ytdl/`
@@ -302,6 +326,8 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
     let a = app.clone();
     app.job(url.clone(), url.clone(), move |job| {
         let app = a;
+        let tmp = std::env::temp_dir().join("mlm-ytdl");
+        let report = tmp.join(format!("{}.progress", job.id)); // ffmpeg's, while it converts
         let mut child = std::process::Command::new("yt-dlp")
             .args(["--js-runtimes", "bun", "--no-playlist", "--playlist-items", "1"])
             .arg("--no-mtime") // "added" is the download, not the upload
@@ -310,13 +336,16 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
             .args(["--ppa", r#"ThumbnailsConvertor+ffmpeg_o:-c:v mjpeg -vf crop="'if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'""#])
             // intermediate files stay out of the library: a concurrent scan would index a half-written .m4a
             .arg("-P").arg(format!("home:{}", app.dir.join("ytdl").display()))
-            .arg("-P").arg(format!("temp:{}", std::env::temp_dir().join("mlm-ytdl").display()))
+            .arg("-P").arg(format!("temp:{}", tmp.display()))
+            // yt-dlp shows nothing while ffmpeg converts, the slow part: have ffmpeg report how far it is, 10x a second
+            .arg("--ppa").arg(format!("ExtractAudio+ffmpeg:-progress '{}' -stats_period 0.1", report.display()))
             // "Artist - Track" when YouTube knows them, else the video title; never the video id.
             // ponytail: two videos with the same artist + title share a filename, the second counts as already
             // downloaded; add %(id)s back (or a counter) if that ever bites
             .args(["-o", "%(artist&{} - |)s%(track,title)s.%(ext)s"])
-            // progress as lines `ytdl_progress` reads, among yt-dlp's own chatter on stdout
-            .args(["--newline", "--progress-template", "download:mlm dl %(progress._percent_str)s %(info.duration)s %(info.artist&{} - |)s%(info.track,info.title)s"])
+            // what yt-dlp shows, a line at a time, for `ytdl_progress`; the download and post-processing lines in a
+            // shape that's easy to tell apart and carries the title
+            .args(["--newline", "--progress-template", "download:mlm dl %(info.duration)s\t%(info.artist&{} - |)s%(info.track,info.title)s\t%(progress._default_template)s"])
             .args(["--progress-template", "postprocess:mlm pp %(progress.postprocessor)s %(progress.status)s"])
             .args(["--", &url])
             .stdout(Stdio::piped())
@@ -329,41 +358,39 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
             let _ = stderr.read_to_string(&mut s);
             s
         });
-        let (over, mp3) = (std::sync::atomic::AtomicBool::new(false), Mutex::new(None::<(PathBuf, f32)>)); // the MP3 being written, its final size
-        let mut secs = 0.0;
+        let (over, secs) = (std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicU32::new(0)); // the track's length, f32 bits
         std::thread::scope(|s| {
-            // ten times a second, so the bar moves between yt-dlp's lines too
+            // the conversion, from ffmpeg's report: the only stage yt-dlp's own lines don't cover
             s.spawn(|| {
                 while !over.load(Ordering::Relaxed) {
-                    let written = mp3.lock().unwrap().as_ref().and_then(|(p, bytes)| Some(std::fs::metadata(p).ok()?.len() as f32 / bytes));
-                    job.set(|j| match (j.text.as_str(), written) {
-                        // no numbers while yt-dlp resolves the link (some 10 s) or tags the file: creep towards the stage's end
-                        (STARTING, _) => j.progress += (0.1 - j.progress) * 0.02,
-                        (TAGGING, _) => j.progress += (1.0 - j.progress) * 0.03,
-                        // yt-dlp passes on nothing from ffmpeg, and converting is the slow part: the MP3 growing
-                        // towards its size at 320 kbps is the progress. ffmpeg writes it a chunk a second: ease
-                        // towards each new size rather than jump
-                        (CONVERTING, Some(part)) => j.progress += (0.5 + 0.4 * part.min(1.0) - j.progress) * 0.15,
-                        _ => {}
-                    });
+                    let len = f32::from_bits(secs.load(Ordering::Relaxed));
+                    if let Some(at) = ffmpeg_secs(&report).filter(|_| len > 0.0) {
+                        let part = (at / len).min(1.0);
+                        job.set(|j| {
+                            if j.text.starts_with(CONVERTING) && 0.5 + 0.4 * part > j.progress {
+                                (j.progress, j.text) = (0.5 + 0.4 * part, format!("{CONVERTING} {:.0}%", part * 100.0));
+                            }
+                        });
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             });
             for line in std::io::BufReader::new(child.stdout.take().unwrap()).split(b'\n').map_while(Result::ok) {
-                let line = String::from_utf8_lossy(&line);
-                if let Some((p, stage, track)) = ytdl_progress(&line) {
+                if let Some((p, stage, track)) = ytdl_progress(&String::from_utf8_lossy(&line)) {
                     job.set(|j| {
-                        (j.progress, j.text) = (p, stage.into());
+                        // a step in resolving the link: part of the way to where the download starts
+                        j.progress = j.progress.max(p.unwrap_or(j.progress + (0.2 - j.progress) * 0.15));
+                        j.text = stage;
                         if let Some((title, len)) = track {
-                            (j.name, secs) = (title.into(), len);
+                            j.name = title.into();
+                            secs.store(len.to_bits(), Ordering::Relaxed);
                         }
                     });
-                } else if let Some(path) = line.trim().strip_prefix("[ExtractAudio] Destination: ").filter(|_| secs > 0.0) {
-                    *mp3.lock().unwrap() = Some((PathBuf::from(path), secs * 40_000.0));
                 }
             }
             over.store(true, Ordering::Relaxed);
         });
+        let _ = std::fs::remove_file(&report);
         let (ok, err) = (child.wait().is_ok_and(|s| s.success()), err.join().unwrap_or_default());
         if !ok {
             return Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp failed").to_owned());
@@ -423,15 +450,46 @@ mod tests {
 
     #[test]
     fn reads_ytdl_progress_lines() {
-        assert_eq!(ytdl_progress("mlm dl   1.2% 19 Me at the zoo"), Some((0.1 + 1.2 / 250.0, "downloading", Some(("Me at the zoo", 19.0)))));
-        assert_eq!(ytdl_progress("mlm dl 100.0% 125.5 A - B\r"), Some((0.1 + 100.0 / 250.0, "downloading", Some(("A - B", 125.5)))));
-        assert_eq!(ytdl_progress("mlm dl 50% NA Live set"), Some((0.1 + 50.0 / 250.0, "downloading", Some(("Live set", 0.0)))));
-        assert_eq!(ytdl_progress("mlm dl Unknown % 19 A - B"), None);
-        assert_eq!(ytdl_progress("mlm dl 50%"), None);
-        assert_eq!(ytdl_progress("mlm pp ExtractAudio started"), Some((0.5, "converting to MP3", None)));
-        assert_eq!(ytdl_progress("mlm pp ExtractAudio finished"), Some((0.9, "adding artwork and tags", None)));
-        assert_eq!(ytdl_progress("mlm pp MoveFiles finished"), None);
-        assert_eq!(ytdl_progress("[download] Destination: /tmp/mlm dl 5% x.webm"), None);
+        let at = |line| ytdl_progress(line).map(|(p, stage, track)| (p, stage, track));
+        let step = |text: &str| Some((None, text.to_string(), None));
+        // resolving the link: yt-dlp's own words, without the video id, the URL, the path
+        assert_eq!(at("[youtube] Extracting URL: https://music.youtube.com/watch?v=abc"), step("Extracting URL"));
+        assert_eq!(at("[youtube] abc: Downloading webpage"), step("Downloading webpage"));
+        assert_eq!(at("[youtube] abc: Downloading visionos player API JSON"), step("Downloading visionos player API JSON"));
+        assert_eq!(at("[info] abc: Downloading 1 format(s): 251"), step("Downloading 1 format(s)"));
+        assert_eq!(at("[info] Writing video thumbnail 41 to: /tmp/mlm-ytdl/A - B.webp"), step("Writing video thumbnail 41"));
+        assert_eq!(at("mlm pp ThumbnailsConvertor started"), step("preparing the artwork"));
+        // the download: yt-dlp's progress text as it shows it, the percentage spread over 20%..50% of the bar
+        assert_eq!(
+            at("mlm dl 125\tA - B\t 24.5% of    2.03MiB at    7.45MiB/s ETA 00:00"),
+            Some((Some(0.2 + 0.3 * 24.5 / 100.0), "downloading 24.5% of 2.03MiB at 7.45MiB/s ETA 00:00".into(), Some(("A - B", 125.0))))
+        );
+        assert_eq!(
+            at("mlm dl NA\tLive set\t100% of    2.03MiB in 00:00:00 at 8.48MiB/s\r"),
+            Some((Some(0.5), "downloading 100% of 2.03MiB in 00:00:00 at 8.48MiB/s".into(), Some(("Live set", 0.0))))
+        );
+        assert_eq!(at("mlm dl 125\tA - B\t   1.20MiB at  500.00KiB/s"), None); // size unknown: no percentage
+        // then the post-processing steps
+        assert_eq!(at("mlm pp ExtractAudio started"), Some((Some(0.5), "converting to MP3".into(), None)));
+        assert_eq!(at("mlm pp Metadata started"), Some((Some(0.9), "adding tags".into(), None)));
+        assert_eq!(at("mlm pp EmbedThumbnail started"), Some((Some(0.94), "adding artwork".into(), None)));
+        assert_eq!(at("mlm pp MoveFiles started"), Some((Some(0.98), "moving into the library".into(), None)));
+        for other in ["mlm pp ExtractAudio finished", "[download] Destination: /tmp/mlm dl 5% x.webm", "[ExtractAudio] Destination: /tmp/x.mp3",
+                      "Deleting original file /tmp/x.webm (pass -k to keep)", ""] {
+            assert_eq!(at(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn reads_ffmpeg_report_tail() {
+        let f = std::env::temp_dir().join(format!("mlm-ffmpeg-report-{}", std::process::id()));
+        assert_eq!(ffmpeg_secs(&f), None); // not started
+        let block = |us: &str, end: &str| format!("bitrate= 320.0kbits/s\ntotal_size=49964\nout_time_us={us}\nout_time_ms={us}\nout_time=00:00:01.231979\nspeed=12.3x\nprogress={end}\n");
+        std::fs::write(&f, block("N/A", "continue")).unwrap();
+        assert_eq!(ffmpeg_secs(&f), None);
+        std::fs::write(&f, block("535979", "continue").repeat(40) + &block("125007000", "end")).unwrap();
+        assert_eq!(ffmpeg_secs(&f), Some(125.007));
+        std::fs::remove_file(&f).unwrap();
     }
 
     #[tokio::test]
