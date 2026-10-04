@@ -75,9 +75,14 @@ Env: `MLM_DIR` (music root), `MLM_ADDR` (default 0.0.0.0:8080), `MLM_CACHE` (ind
 
 Paste a YouTube or YouTube Music link into the search box (or type it and press enter): the server downloads it
 (`POST /api/ytdl`, body = the link) as a 320 kbps MP3 with title / artist tags and square cover art into
-`MLM_DIR/ytdl/`, named `Artist - Track.mp3` (or the video title), re-indexes, and the search shows the new track,
-ready to play, analyze and tag. It needs `yt-dlp`, `ffmpeg` and `bun` on the service's PATH: `make ytdl-deps`
-installs yt-dlp and links bun into `/usr/local/bin` on the Pi; rerun it to update yt-dlp when YouTube breaks it.
+`MLM_DIR/ytdl/`, named `Artist - Track.mp3` (or the video title), and re-indexes: the track joins the list (sort
+by "added" to find it), ready to play, analyze and tag. It needs `yt-dlp`, `ffmpeg` and `bun` on the service's
+PATH: `make ytdl-deps` installs yt-dlp and links bun into `/usr/local/bin` on the Pi; rerun it to update yt-dlp
+when YouTube breaks it.
+
+Downloads and BPM analyses are jobs on the server: any number can be started, 5 run at a time and the rest wait
+their turn. The UI polls `GET /api/jobs` while there are any and shows a progress bar per running job above the
+player (download, then conversion to MP3; for an analysis, how much is decoded), plus how many are queued.
 
 ## Tags
 

@@ -14,7 +14,7 @@ use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::{ItemKey, Tag};
 
 const HOP: usize = 128;
-const MAX_SECS: u64 = 240; // ponytail: first 4 min only (a 96-min mix would take a minute to decode on the Pi)
+pub const MAX_SECS: u64 = 240; // ponytail: first 4 min only (a 96-min mix would take a minute to decode on the Pi)
 
 /// Streaming onset envelope of a mono signal.
 struct Onsets {
@@ -69,15 +69,21 @@ fn tempo(mut env: Vec<f32>, fps: f64) -> Option<f64> {
     (-150..=150).map(|d| coarse + d as f64 / 100.0).max_by(|a, b| score(*a, 16).total_cmp(&score(*b, 16)))
 }
 
-/// Decode (up to MAX_SECS) and detect the tempo.
-pub fn detect(path: &Path) -> io::Result<Option<f64>> {
+/// Decode (up to MAX_SECS) and detect the tempo; `on_secs` hears each further second decoded.
+pub fn detect(path: &Path, mut on_secs: impl FnMut(u64)) -> io::Result<Option<f64>> {
     let mut o: Option<(Onsets, u32)> = None;
+    let mut last = 0;
     crate::decode::each_packet(path, |_, rate, ch, samples| {
         let (on, _) = o.get_or_insert_with(|| (Onsets::new(rate), rate));
         for f in samples.chunks_exact(ch) {
             on.push(f.iter().map(|&s| s as f32 / 2147483648.0).sum::<f32>() / ch as f32);
         }
-        Ok(((on.env.len() * HOP) as u64 / rate as u64) < MAX_SECS)
+        let secs = (on.env.len() * HOP) as u64 / rate as u64;
+        if secs != last {
+            last = secs;
+            on_secs(secs);
+        }
+        Ok(secs < MAX_SECS)
     })?;
     Ok(o.and_then(|(on, rate)| tempo(on.env, rate as f64 / HOP as f64)))
 }

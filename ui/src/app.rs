@@ -37,8 +37,9 @@ pub struct App {
     enter: bool,           // enter pressed this frame: play the cursor row
     center: bool,          // scroll the cursor row to the middle of the list this frame
     sort: Option<(usize, bool)>, // column, descending; None = library order
-    analyzed: Rc<RefCell<Option<(u64, Result<u32, String>)>>>, // ctrl+a result lands here
-    ytdl: Rc<RefCell<Option<Result<String, String>>>>, // YouTube download result lands here: the new track's rel
+    jobs: Vec<Job>,                            // the server's downloads and analyses, as of the last answer
+    jobs_in: Rc<RefCell<Option<Vec<Job>>>>,    // its job list lands here: when a job is started, then by polling
+    poll: (f64, f64),                          // egui time of the last /api/jobs poll, and when to stop if the list is empty
     status: Option<(String, f64)>, // message and the egui time it disappears at
     note: Rc<RefCell<Option<String>>>, // status messages from async work (share)
     can_share: bool,                   // the browser can share files (Android / iOS share sheet)
@@ -50,6 +51,22 @@ pub struct App {
     list_key: (String, Option<(usize, bool)>, u64), // (query, sort, gen) the cached list was built for
     list_idx: Vec<usize>, // that list, as indices into `tracks`
     fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
+}
+
+/// A download or an analysis running (or waiting its turn) on the server: see `Job` in src/main.rs.
+#[derive(serde::Deserialize)]
+struct Job {
+    id: u64,
+    name: String,
+    state: String, // queued | running | done | failed
+    text: String,  // the stage while running, then the result or the error
+    progress: f32, // 0..1
+}
+
+impl Job {
+    fn live(&self) -> bool {
+        self.state == "queued" || self.state == "running"
+    }
 }
 
 /// GET a JSON API; `unreachable` is set when sw.js had to answer from its cache (the Pi is out of reach).
@@ -107,7 +124,7 @@ impl App {
         Self {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sel: None, step: 0, enter: false, center: false, sort: None,
-            analyzed: Rc::default(), ytdl: Rc::default(), status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
+            jobs: vec![], jobs_in: Rc::default(), poll: (-1.0, 1.0), /* one poll at startup: jobs survive a reload */ status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
             off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
@@ -139,44 +156,34 @@ impl App {
 
     /// Detect the playing track's BPM on the server, which writes it into the file's tag.
     fn analyze(&mut self, ctx: &egui::Context) {
-        let Some(t) = self.player.borrow().track().cloned() else { return };
-        self.status = Some((format!("analyzing {}…", filename(&t)), f64::INFINITY));
-        let (inbox, ctx) = (self.analyzed.clone(), ctx.clone());
-        spawn_local(async move {
-            let r = async {
-                let init = RequestInit::new();
-                init.set_method("POST");
-                let url = format!("/api/tracks/{}/analyze", t.id);
-                let res: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str_and_init(&url, &init)).await?.dyn_into()?;
-                let body = JsFuture::from(res.text()?).await?.as_string().unwrap_or_default();
-                if !res.ok() {
-                    return Err(JsValue::from(body));
-                }
-                #[derive(serde::Deserialize)]
-                struct R { bpm: u32 }
-                serde_json::from_str::<R>(&body).map(|r| r.bpm).map_err(|e| e.to_string().into())
-            }
-            .await;
-            *inbox.borrow_mut() = Some((t.id, r.map_err(|e| e.as_string().unwrap_or_else(|| "network error".into()))));
-            ctx.request_repaint();
-        });
+        let Some(id) = self.player.borrow().track().map(|t| t.id) else { return };
+        self.start_job(format!("/api/tracks/{id}/analyze"), None, ctx);
     }
 
-    /// Have the server download a YouTube link as an MP3 into the library's ytdl/ folder.
-    fn ytdl(&mut self, url: String, ctx: &egui::Context) {
-        self.status = Some(("downloading…".into(), f64::INFINITY));
-        let (inbox, ctx) = (self.ytdl.clone(), ctx.clone());
+    /// Start a server job: an analysis, or (with a YouTube link as `body`) a download into the library's ytdl/
+    /// folder. The answer is the server's job list; `ui` shows it and keeps polling until it's empty.
+    fn start_job(&mut self, url: String, body: Option<String>, ctx: &egui::Context) {
+        self.poll.1 = ctx.input(|i| i.time) + 5.0; // keep asking even if an older, empty answer overtakes this one
+        let (inbox, note, ctx) = (self.jobs_in.clone(), self.note.clone(), ctx.clone());
         spawn_local(async move {
-            let r: Result<String, JsValue> = async {
+            let r: Result<Vec<Job>, JsValue> = async {
                 let init = RequestInit::new();
                 init.set_method("POST");
-                init.set_body(&url.into());
-                let res: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str_and_init("/api/ytdl", &init)).await?.dyn_into()?;
-                let body = JsFuture::from(res.text()?).await?.as_string().unwrap_or_default();
-                if res.ok() { Ok(body) } else { Err(body.into()) }
+                if let Some(b) = body {
+                    init.set_body(&b.into());
+                }
+                let res: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str_and_init(&url, &init)).await?.dyn_into()?;
+                let text = JsFuture::from(res.text()?).await?.as_string().unwrap_or_default();
+                if !res.ok() {
+                    return Err(text.into());
+                }
+                serde_json::from_str(&text).map_err(|e| e.to_string().into())
             }
             .await;
-            *inbox.borrow_mut() = Some(r.map_err(|e| e.as_string().unwrap_or_else(|| "network error".into())));
+            match r {
+                Ok(jobs) => *inbox.borrow_mut() = Some(jobs),
+                Err(e) => *note.borrow_mut() = Some(e.as_string().unwrap_or_else(|| "network error".into())),
+            }
             ctx.request_repaint();
         });
     }
@@ -678,32 +685,21 @@ impl eframe::App for App {
             self.last_flush = now; // retry queued tag edits while the Pi is out of reach
             self.off.flush();
         }
-        if let Some((id, r)) = self.analyzed.borrow_mut().take() {
-            let name = self.tracks.iter().find(|t| t.id == id).map_or(String::new(), |t| filename(t).to_owned());
-            self.status = Some((
-                match r {
-                    Ok(bpm) => {
-                        self.tracks.iter_mut().filter(|t| t.id == id).for_each(|t| t.bpm = bpm);
-                        self.gen += 1;
-                        format!("{bpm} BPM written to {name}")
-                    }
-                    Err(e) => format!("analyze failed: {e}"),
-                },
-                now + 5.0,
-            ));
+        if let Some(jobs) = self.jobs_in.borrow_mut().take() {
+            // a job this page was watching ended (or left the list while the tab slept): a new track, a new BPM
+            if self.jobs.iter().any(|old| old.live() && !jobs.iter().any(|j| j.id == old.id && j.live())) {
+                load(&self.inbox, ui.ctx(), &self.off.unreachable, true);
+            }
+            self.jobs = jobs;
         }
-        if let Some(r) = self.ytdl.borrow_mut().take() {
-            self.status = Some((
-                match r {
-                    Ok(rel) => {
-                        load(&self.inbox, ui.ctx(), &self.off.unreachable, true);
-                        self.q = rel; // the list shows just the new track: play, analyze, tag
-                        format!("downloaded {}", self.q)
-                    }
-                    Err(e) => format!("download failed: {e}"),
-                },
-                now + 5.0,
-            ));
+        if (!self.jobs.is_empty() || now < self.poll.1) && now - self.poll.0 > 0.5 {
+            self.poll.0 = now;
+            let (inbox, ctx, unreachable) = (self.jobs_in.clone(), ui.ctx().clone(), self.off.unreachable.clone());
+            spawn_local(async move {
+                // the Pi out of reach reads as an empty list, which also ends the polling
+                *inbox.borrow_mut() = Some(get_json("/api/jobs", &unreachable).await.unwrap_or_default());
+                ctx.request_repaint();
+            });
         }
         if let Some(msg) = self.note.borrow_mut().take() {
             self.status = (!msg.is_empty()).then_some((msg, now + 5.0));
@@ -728,7 +724,7 @@ impl eframe::App for App {
             let pasted = r.changed() && (self.q.len() > before + 1 || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))));
             if link && (pasted || r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
                 let url = std::mem::take(&mut self.q).trim().to_owned();
-                self.ytdl(url, ui.ctx());
+                self.start_job("/api/ytdl".into(), Some(url), ui.ctx());
             }
             ui.collapsing("tags", |ui| self.tags_panel(ui));
             if self.off.unreachable.get() {
@@ -747,6 +743,24 @@ impl eframe::App for App {
             }
         });
         egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
+        if !self.jobs.is_empty() {
+            // one bar per running (or just finished) download / analysis, above the player
+            egui::Panel::bottom("jobs").show(ui, |ui| {
+                ui.add_space(4.0);
+                for j in self.jobs.iter().filter(|j| j.state != "queued") {
+                    if j.state == "failed" {
+                        ui.colored_label(ui.visuals().error_fg_color, format!("{} — failed: {}", j.name, j.text));
+                    } else {
+                        ui.add(egui::ProgressBar::new(j.progress).text(format!("{} — {}", j.name, j.text)));
+                    }
+                }
+                let queued = self.jobs.iter().filter(|j| j.state == "queued").count();
+                if queued > 0 {
+                    ui.weak(format!("{queued} more queued"));
+                }
+                ui.add_space(4.0);
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| self.list(ui));
         if let Some((dt, cpu)) = &mut self.fps {
             // smoothed over ~20 frames; repaint continuously so the number is the real frame rate

@@ -7,7 +7,9 @@ mod library;
 mod tags;
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Request, State};
@@ -23,38 +25,112 @@ use library::Track;
 const COOP: header::HeaderName = header::HeaderName::from_static("cross-origin-opener-policy");
 const COEP: header::HeaderName = header::HeaderName::from_static("cross-origin-embedder-policy");
 
+const MAX_JOBS: usize = 5; // downloads + analyses running at once; the rest wait their turn
+
+/// A download or an analysis: queued, then run on a blocking thread, MAX_JOBS at a time. UIs poll `/api/jobs`.
+#[derive(Clone, serde::Serialize)]
+struct Job {
+    id: u64,
+    #[serde(skip)]
+    key: String, // what it works on (a link, a file): asking again while it's pending adds nothing
+    name: String,
+    state: &'static str, // queued | running | done | failed
+    text: String,        // the stage while running, then the result or the error
+    progress: f32,       // 0..1
+    #[serde(skip)]
+    end: Option<Instant>,
+}
+
+/// A running job's handle on its own entry in the list.
+struct JobRef {
+    jobs: Arc<Mutex<Vec<Job>>>,
+    id: u64,
+}
+
+impl JobRef {
+    fn set(&self, f: impl FnOnce(&mut Job)) {
+        if let Some(j) = self.jobs.lock().unwrap().iter_mut().find(|j| j.id == self.id) {
+            f(j);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct App {
     tracks: Arc<RwLock<Arc<Vec<Track>>>>,
     dir: PathBuf,
     cache: PathBuf,
     tags: PathBuf,
-    tags_lock: Arc<std::sync::Mutex<()>>, // serializes read-apply-write of the tags file
+    tags_lock: Arc<Mutex<()>>, // serializes read-apply-write of the tags file
+    scan_lock: Arc<Mutex<()>>, // one scan at a time: they all rewrite the cache file
+    jobs: Arc<Mutex<Vec<Job>>>,
+    next_job: Arc<AtomicU64>,
+    slots: Arc<tokio::sync::Semaphore>, // MAX_JOBS permits, handed out in arrival order
 }
 
 impl App {
+    fn new(dir: PathBuf, cache: PathBuf, tags: PathBuf) -> Self {
+        Self {
+            dir, cache, tags, tracks: Default::default(), tags_lock: Default::default(), scan_lock: Default::default(),
+            jobs: Default::default(), next_job: Default::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_JOBS)),
+        }
+    }
     fn tracks(&self) -> Arc<Vec<Track>> {
         self.tracks.read().unwrap().clone()
     }
+    /// Re-index, blocking until the new list is being served.
+    fn scan(&self) {
+        let _g = self.scan_lock.lock().unwrap();
+        let t = library::scan(&self.dir, &self.cache);
+        *self.tracks.write().unwrap() = Arc::new(t);
+    }
     fn rescan(&self) {
         let app = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let t = library::scan(&app.dir, &app.cache);
-            *app.tracks.write().unwrap() = Arc::new(t);
-        });
+        tokio::task::spawn_blocking(move || app.scan());
+    }
+
+    /// Queue `work` as a job and answer with the job list. `work` reports its stage and progress through the
+    /// `JobRef` and returns the text the job ends with. It runs to the end even if the client hangs up.
+    fn job(&self, key: String, name: String, work: impl FnOnce(&JobRef) -> Result<String, String> + Send + 'static) -> Response {
+        let mut jobs = self.jobs.lock().unwrap();
+        if !jobs.iter().any(|j| j.key == key && j.end.is_none()) {
+            let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+            jobs.push(Job { id, key, name, state: "queued", text: "queued".into(), progress: 0.0, end: None });
+            let app = self.clone();
+            tokio::spawn(async move {
+                let _slot = app.slots.acquire().await.unwrap();
+                let (me, end) = (JobRef { jobs: app.jobs.clone(), id }, JobRef { jobs: app.jobs.clone(), id });
+                me.set(|j| (j.state, j.text) = ("running", "starting".into()));
+                let r = tokio::task::spawn_blocking(move || work(&me)).await.unwrap_or_else(|e| Err(e.to_string()));
+                end.set(|j| {
+                    (j.state, j.text) = match r {
+                        Ok(text) => ("done", text),
+                        Err(e) => ("failed", e),
+                    };
+                    (j.progress, j.end) = (1.0, Some(Instant::now()));
+                });
+            });
+        }
+        drop(jobs);
+        self.jobs_json()
+    }
+
+    /// The job list. Finished jobs stay on it for a few seconds (failures longer) so polling UIs see how they ended.
+    fn jobs_json(&self) -> Response {
+        let mut jobs = self.jobs.lock().unwrap();
+        jobs.retain(|j| j.end.is_none_or(|t| t.elapsed().as_secs() < if j.state == "failed" { 30 } else { 5 }));
+        ([(header::CONTENT_TYPE, "application/json")], serde_json::to_vec(&*jobs).unwrap()).into_response()
     }
 }
 
 #[tokio::main]
 async fn main() {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-    let app = App {
-        dir: PathBuf::from(env("MLM_DIR", ".")),
-        cache: PathBuf::from(env("MLM_CACHE", "mlm-index.json")),
-        tags: PathBuf::from(env("MLM_TAGS", "mlm-tags.json")),
-        tracks: Default::default(),
-        tags_lock: Default::default(),
-    };
+    let app = App::new(
+        PathBuf::from(env("MLM_DIR", ".")),
+        PathBuf::from(env("MLM_CACHE", "mlm-index.json")),
+        PathBuf::from(env("MLM_TAGS", "mlm-tags.json")),
+    );
     *app.tracks.write().unwrap() = Arc::new(library::load_cache(&app.dir, &app.cache));
     app.rescan();
 
@@ -78,6 +154,7 @@ async fn main() {
         .route("/api/tags", get(tags_get))
         .route("/api/tags/ops", post(tags_ops))
         .route("/api/ytdl", post(ytdl))
+        .route("/api/jobs", get(|State(app): State<App>| async move { app.jobs_json() }))
         .route("/api/rescan", post(|State(app): State<App>| async move { app.rescan(); StatusCode::ACCEPTED }))
         .with_state(app);
 
@@ -164,27 +241,23 @@ async fn art(State(app): State<App>, Path(id): Path<u64>) -> Response {
     ([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "max-age=86400".into())], body).into_response()
 }
 
-/// Detect the tempo, write it to the file's BPM tag, re-index. `{"bpm": 124}`, or 422 when no tempo is found.
+/// A job: detect the tempo, write it to the file's BPM tag, re-index. Ends as "124 BPM", or fails with "no tempo found".
 async fn analyze(State(app): State<App>, Path(id): Path<u64>) -> Response {
-    let Some(path) = app.tracks().iter().find(|t| t.id == id).map(|t| t.path.clone()) else {
+    let Some(t) = app.tracks().iter().find(|t| t.id == id).cloned() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let r = tokio::task::spawn_blocking(move || -> std::io::Result<Option<u32>> {
-        let Some(bpm) = bpm::detect(&path)? else { return Ok(None) };
-        let bpm = bpm.round() as u32;
-        bpm::write(&path, bpm)?;
-        Ok(Some(bpm))
+    let name = t.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let a = app.clone();
+    app.job(t.path.to_string_lossy().into_owned(), name, move |job| {
+        job.set(|j| j.text = "analyzing".into());
+        let secs = (t.duration_ms / 1000).clamp(1, bpm::MAX_SECS) as f32; // what detect will decode
+        let bpm = bpm::detect(&t.path, |s| job.set(|j| j.progress = (s as f32 / secs).min(1.0) * 0.9)).map_err(|e| e.to_string())?;
+        let bpm = bpm.ok_or("no tempo found")?.round() as u32;
+        job.set(|j| j.text = "writing the tag".into());
+        bpm::write(&t.path, bpm).map_err(|e| e.to_string())?;
+        a.scan(); // only this file's mtime changed: one re-tag
+        Ok(format!("{bpm} BPM"))
     })
-    .await
-    .unwrap();
-    match r {
-        Ok(Some(bpm)) => {
-            app.rescan(); // only this file's mtime changed: one re-tag
-            ([(header::CONTENT_TYPE, "application/json")], format!(r#"{{"bpm":{bpm}}}"#)).into_response()
-        }
-        Ok(None) => (StatusCode::UNPROCESSABLE_ENTITY, "no tempo found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
 }
 
 /// Only YouTube / YouTube Music links reach yt-dlp, which would fetch from a thousand other sites too.
@@ -194,16 +267,35 @@ fn yt_url(u: &str) -> bool {
     !u.contains(char::is_whitespace) && matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be")
 }
 
-/// Download a YouTube link (the request body) as a 320 kbps MP3 with square cover art into `MLM_DIR/ytdl/` and
-/// index it; answers with the new track's `rel`. Needs yt-dlp, ffmpeg and bun on PATH (`make ytdl-deps`).
+/// One of the progress lines `ytdl` has yt-dlp print, as (progress 0..1, stage, title once known): the download
+/// fills the first half of the bar, the MP3 conversion most of the rest.
+fn ytdl_progress(line: &str) -> Option<(f32, &'static str, Option<&str>)> {
+    let l = line.trim().strip_prefix("mlm ")?;
+    if let Some(l) = l.strip_prefix("dl ") {
+        let (pct, title) = l.trim_start().split_once(' ').unwrap_or((l.trim(), ""));
+        let pct: f32 = pct.trim_end_matches('%').parse().ok()?; // "Unknown %" when the size isn't known: no news
+        return Some((pct.clamp(0.0, 100.0) / 200.0, "downloading", Some(title.trim()).filter(|t| !t.is_empty())));
+    }
+    match l.strip_prefix("pp ")? {
+        "ExtractAudio started" => Some((0.5, "converting to MP3", None)),
+        "ExtractAudio finished" => Some((0.9, "adding artwork and tags", None)),
+        _ => None,
+    }
+}
+
+/// A job: download a YouTube link (the request body) as a 320 kbps MP3 with square cover art into `MLM_DIR/ytdl/`
+/// and index it. Needs yt-dlp, ffmpeg and bun on PATH (`make ytdl-deps`).
 async fn ytdl(State(app): State<App>, url: String) -> Response {
+    use std::io::{BufRead, Read};
+    use std::process::Stdio;
     let url = url.trim().to_owned();
     if !yt_url(&url) {
         return (StatusCode::BAD_REQUEST, "not a YouTube link").into_response();
     }
-    // download + scan in one blocking task: it finishes (and the track is indexed) even if the phone hangs up
-    let r = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let out = std::process::Command::new("yt-dlp")
+    let a = app.clone();
+    app.job(url.clone(), url.clone(), move |job| {
+        let app = a;
+        let mut child = std::process::Command::new("yt-dlp")
             .args(["--js-runtimes", "bun", "--no-playlist", "--playlist-items", "1"])
             .arg("--no-mtime") // "added" is the download, not the upload
             .args(["-x", "--audio-format", "mp3", "--audio-quality", "320K"])
@@ -216,25 +308,37 @@ async fn ytdl(State(app): State<App>, url: String) -> Response {
             // ponytail: two videos with the same artist + title share a filename, the second counts as already
             // downloaded; add %(id)s back (or a counter) if that ever bites
             .args(["-o", "%(artist&{} - |)s%(track,title)s.%(ext)s"])
-            .args(["--print", "after_move:filepath", "--", &url])
-            .output()
+            // progress as lines `ytdl_progress` reads, among yt-dlp's own chatter on stdout
+            .args(["--newline", "--progress-template", "download:mlm dl %(progress._percent_str)s %(info.artist&{} - |)s%(info.track,info.title)s"])
+            .args(["--progress-template", "postprocess:mlm pp %(progress.postprocessor)s %(progress.status)s"])
+            .args(["--", &url])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("yt-dlp: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
+        let mut stderr = child.stderr.take().unwrap();
+        let err = std::thread::spawn(move || {
+            let mut s = String::new(); // drained on the side: a full stderr pipe would stall yt-dlp
+            let _ = stderr.read_to_string(&mut s);
+            s
+        });
+        for line in std::io::BufReader::new(child.stdout.take().unwrap()).split(b'\n').map_while(Result::ok) {
+            if let Some((p, stage, title)) = ytdl_progress(&String::from_utf8_lossy(&line)) {
+                job.set(|j| {
+                    (j.progress, j.text) = (p, stage.into());
+                    if let Some(t) = title {
+                        j.name = t.into();
+                    }
+                });
+            }
+        }
+        let (ok, err) = (child.wait().is_ok_and(|s| s.success()), err.join().unwrap_or_default());
+        if !ok {
             return Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp failed").to_owned());
         }
-        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or_default().trim());
-        let name = path.file_name().ok_or("yt-dlp printed no file")?.to_string_lossy().into_owned();
-        let t = library::scan(&app.dir, &app.cache);
-        *app.tracks.write().unwrap() = Arc::new(t);
-        Ok(format!("ytdl/{name}"))
+        app.scan();
+        Ok("downloaded".into())
     })
-    .await
-    .unwrap();
-    match r {
-        Ok(rel) => rel.into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
 }
 
 /// The original file, untouched (ctrl+d in the UI); the browser names it via the anchor's `download`.
@@ -283,7 +387,49 @@ fn parse_range(headers: &HeaderMap, total: u64) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::yt_url;
+    use super::*;
+
+    #[test]
+    fn reads_ytdl_progress_lines() {
+        assert_eq!(ytdl_progress("mlm dl   1.2% Me at the zoo"), Some((0.006, "downloading", Some("Me at the zoo"))));
+        assert_eq!(ytdl_progress("mlm dl 100.0% A - B\r"), Some((0.5, "downloading", Some("A - B"))));
+        assert_eq!(ytdl_progress("mlm dl 50%"), Some((0.25, "downloading", None)));
+        assert_eq!(ytdl_progress("mlm dl Unknown % A - B"), None);
+        assert_eq!(ytdl_progress("mlm pp ExtractAudio started"), Some((0.5, "converting to MP3", None)));
+        assert_eq!(ytdl_progress("mlm pp ExtractAudio finished"), Some((0.9, "adding artwork and tags", None)));
+        assert_eq!(ytdl_progress("mlm pp MoveFiles finished"), None);
+        assert_eq!(ytdl_progress("[download] Destination: /tmp/mlm dl 5% x.webm"), None);
+    }
+
+    #[tokio::test]
+    async fn jobs_run_five_at_a_time_in_order_and_all_finish() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let app = App::new(PathBuf::new(), PathBuf::new(), PathBuf::new());
+        let (now, max) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        for i in 0..8 {
+            let (now, max) = (now.clone(), max.clone());
+            app.job(format!("k{i}"), format!("job {i}"), move |job| {
+                max.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                job.set(|j| j.progress = 0.5);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                now.fetch_sub(1, SeqCst);
+                if i == 7 { Err("boom".into()) } else { Ok(format!("ok {i}")) }
+            });
+        }
+        app.job("k0".into(), "again".into(), |_| Ok("dup".into())); // k0 is pending: not queued a second time
+        assert_eq!(app.jobs.lock().unwrap().len(), 8);
+        let wait = || tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(30)));
+        wait().await.unwrap();
+        let states: Vec<_> = app.jobs.lock().unwrap().iter().map(|j| j.state).collect();
+        assert_eq!(states, ["running", "running", "running", "running", "running", "queued", "queued", "queued"]);
+        while app.jobs.lock().unwrap().iter().any(|j| j.end.is_none()) {
+            wait().await.unwrap();
+        }
+        assert_eq!(max.load(SeqCst), MAX_JOBS);
+        let jobs = app.jobs.lock().unwrap().clone();
+        assert!(jobs[..7].iter().enumerate().all(|(i, j)| j.state == "done" && j.text == format!("ok {i}") && j.progress == 1.0));
+        assert_eq!((jobs[7].state, jobs[7].text.as_str()), ("failed", "boom"));
+    }
 
     #[test]
     fn only_youtube_links_pass() {
