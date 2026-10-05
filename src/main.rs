@@ -63,6 +63,8 @@ struct App {
     tags: PathBuf,
     tags_lock: Arc<Mutex<()>>, // serializes read-apply-write of the tags file
     scan_lock: Arc<Mutex<()>>, // one scan at a time: they all rewrite the cache file
+    gen: Arc<AtomicU64>,       // goes up with every scan: UIs reload the track list when it has moved
+    indexed: Arc<AtomicU64>,   // the library's fingerprint as of the last scan, for `watch`
     jobs: Arc<Mutex<Vec<Job>>>,
     next_job: Arc<AtomicU64>,
     slots: Arc<tokio::sync::Semaphore>, // MAX_JOBS permits, handed out in arrival order
@@ -72,6 +74,9 @@ impl App {
     fn new(dir: PathBuf, cache: PathBuf, tags: PathBuf) -> Self {
         Self {
             dir, cache, tags, tracks: Default::default(), tags_lock: Default::default(), scan_lock: Default::default(),
+            // from the clock, so a restarted server never repeats a number a UI has already seen
+            gen: Arc::new(AtomicU64::new(std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis() as u64))),
+            indexed: Default::default(),
             jobs: Default::default(), next_job: Default::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_JOBS)),
         }
     }
@@ -81,12 +86,30 @@ impl App {
     /// Re-index, blocking until the new list is being served.
     fn scan(&self) {
         let _g = self.scan_lock.lock().unwrap();
+        self.indexed.store(library::fingerprint(&self.dir), Ordering::Relaxed); // taken first: a change mid-scan gets another
         let t = library::scan(&self.dir, &self.cache);
         *self.tracks.write().unwrap() = Arc::new(t);
+        self.gen.fetch_add(1, Ordering::Relaxed);
     }
     fn rescan(&self) {
         let app = self.clone();
         tokio::task::spawn_blocking(move || app.scan());
+    }
+    /// Keep the index in step with the folder, forever: files copied in, deleted or re-tagged by other programs show
+    /// up without a restart or a rescan. A change is indexed once it has held still for one poll, so a copy in
+    /// progress (its size still growing) waits until it's whole.
+    // ponytail: polling, 45 ms per look at 1650 tracks on the Pi 4 = 2.4% of a core, growing with the library;
+    // inotify (libc is already here) would make it free and instant, if that ever matters
+    fn watch(&self) {
+        let mut before = library::fingerprint(&self.dir);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let now = library::fingerprint(&self.dir);
+            if now == before && now != self.indexed.load(Ordering::Relaxed) {
+                self.scan();
+            }
+            before = now;
+        }
     }
 
     /// Queue `work` as a job and answer with the job list. `work` reports its stage and progress through the
@@ -115,11 +138,13 @@ impl App {
         self.jobs_json()
     }
 
-    /// The job list. Finished jobs stay on it for a few seconds (failures longer) so polling UIs see how they ended.
+    /// What UIs poll: `{"gen": .., "jobs": [..]}`, the library's generation (see `gen`) and the job list. Finished
+    /// jobs stay on the list for a few seconds (failures longer) so every UI sees how they ended.
     fn jobs_json(&self) -> Response {
         let mut jobs = self.jobs.lock().unwrap();
         jobs.retain(|j| j.end.is_none_or(|t| t.elapsed().as_secs() < if j.state == "failed" { 30 } else { 5 }));
-        ([(header::CONTENT_TYPE, "application/json")], serde_json::to_vec(&*jobs).unwrap()).into_response()
+        let body = format!(r#"{{"gen":{},"jobs":{}}}"#, self.gen.load(Ordering::Relaxed), serde_json::to_string(&*jobs).unwrap());
+        ([(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
 }
 
@@ -133,6 +158,8 @@ async fn main() {
     );
     *app.tracks.write().unwrap() = Arc::new(library::load_cache(&app.dir, &app.cache));
     app.rescan();
+    let watcher = app.clone();
+    std::thread::spawn(move || watcher.watch());
 
     let router = Router::new()
         .route("/", get(index))

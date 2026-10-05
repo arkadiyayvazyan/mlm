@@ -38,8 +38,9 @@ pub struct App {
     center: bool,          // scroll the cursor row to the middle of the list this frame
     sort: Option<(usize, bool)>, // column, descending; None = library order
     jobs: Vec<Job>,                            // the server's downloads and analyses, as of the last answer
-    jobs_in: Rc<RefCell<Option<Vec<Job>>>>,    // its job list lands here: when a job is started, then by polling
-    poll: (f64, f64),                          // egui time of the last /api/jobs poll, and when to stop if the list is empty
+    jobs_in: Rc<RefCell<Option<Option<Status>>>>, // the server's status lands here, from polling and from starting a job; None = out of reach
+    poll: (f64, bool),                         // egui time of the last /api/jobs poll, and whether the last one got through
+    lib_gen: Option<u64>,                      // the server's library generation our track list is from
     status: Option<(String, f64)>, // message and the egui time it disappears at
     note: Rc<RefCell<Option<String>>>, // status messages from async work (share)
     can_share: bool,                   // the browser can share files (Android / iOS share sheet)
@@ -63,10 +64,12 @@ struct Job {
     progress: f32, // 0..1
 }
 
-impl Job {
-    fn live(&self) -> bool {
-        self.state == "queued" || self.state == "running"
-    }
+/// What `/api/jobs` answers: the jobs, and a number that moves whenever the server re-indexes the library
+/// (a download, an analysis, files copied into the folder).
+#[derive(serde::Deserialize)]
+struct Status {
+    gen: u64,
+    jobs: Vec<Job>,
 }
 
 /// GET a JSON API; `unreachable` is set when sw.js had to answer from its cache (the Pi is out of reach).
@@ -124,7 +127,7 @@ impl App {
         Self {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sel: None, step: 0, enter: false, center: false, sort: None,
-            jobs: vec![], jobs_in: Rc::default(), poll: (-1.0, 1.0), /* one poll at startup: jobs survive a reload */ status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
+            jobs: vec![], jobs_in: Rc::default(), poll: (-1.0, true), lib_gen: None, status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
             off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
@@ -163,10 +166,9 @@ impl App {
     /// Start a server job: an analysis, or (with a YouTube link as `body`) a download into the library's ytdl/
     /// folder. The answer is the server's job list; `ui` shows it and keeps polling until it's empty.
     fn start_job(&mut self, url: String, body: Option<String>, ctx: &egui::Context) {
-        self.poll.1 = ctx.input(|i| i.time) + 5.0; // keep asking even if an older, empty answer overtakes this one
         let (inbox, note, ctx) = (self.jobs_in.clone(), self.note.clone(), ctx.clone());
         spawn_local(async move {
-            let r: Result<Vec<Job>, JsValue> = async {
+            let r: Result<Status, JsValue> = async {
                 let init = RequestInit::new();
                 init.set_method("POST");
                 if let Some(b) = body {
@@ -181,7 +183,7 @@ impl App {
             }
             .await;
             match r {
-                Ok(jobs) => *inbox.borrow_mut() = Some(jobs),
+                Ok(status) => *inbox.borrow_mut() = Some(Some(status)),
                 Err(e) => *note.borrow_mut() = Some(e.as_string().unwrap_or_else(|| "network error".into())),
             }
             ctx.request_repaint();
@@ -685,19 +687,24 @@ impl eframe::App for App {
             self.last_flush = now; // retry queued tag edits while the Pi is out of reach
             self.off.flush();
         }
-        if let Some(jobs) = self.jobs_in.borrow_mut().take() {
-            // a job this page was watching ended (or left the list while the tab slept): a new track, a new BPM
-            if self.jobs.iter().any(|old| old.live() && !jobs.iter().any(|j| j.id == old.id && j.live())) {
+        if let Some(status) = self.jobs_in.borrow_mut().take() {
+            self.poll.1 = status.is_some();
+            let Status { gen, jobs } = status.unwrap_or(Status { gen: self.lib_gen.unwrap_or(0), jobs: vec![] });
+            // the library changed on the server (a finished download or analysis, files copied into the folder,
+            // also while this tab slept): fetch the new list
+            if self.lib_gen.replace(gen).is_some_and(|old| old != gen) {
                 load(&self.inbox, ui.ctx(), &self.off.unreachable, true);
             }
             self.jobs = jobs;
         }
-        if (!self.jobs.is_empty() || now < self.poll.1) && now - self.poll.0 > 0.25 {
+        // polled for as long as the page shows: often while jobs run, now and then otherwise (that's how tracks
+        // copied into the folder and jobs started elsewhere turn up), rarely while the Pi is out of reach
+        let every = if !self.poll.1 { 15.0 } else if self.jobs.is_empty() { 2.0 } else { 0.25 };
+        if now - self.poll.0 > every {
             self.poll.0 = now;
             let (inbox, ctx, unreachable) = (self.jobs_in.clone(), ui.ctx().clone(), self.off.unreachable.clone());
             spawn_local(async move {
-                // the Pi out of reach reads as an empty list, which also ends the polling
-                *inbox.borrow_mut() = Some(get_json("/api/jobs", &unreachable).await.unwrap_or_default());
+                *inbox.borrow_mut() = Some(get_json("/api/jobs", &unreachable).await);
                 ctx.request_repaint();
             });
         }

@@ -69,7 +69,11 @@ Home Screen". Below 600 pt wide the list switches to two-line rows and the playe
 
 Env: `MLM_DIR` (music root), `MLM_ADDR` (default 0.0.0.0:8080), `MLM_CACHE` (index JSON path),
 `MLM_TAGS` (user tags JSON path, default `mlm-tags.json`).
-`POST /api/rescan` re-indexes; only files with a changed mtime are re-tagged.
+The library folder is watched: every 2 s the server fingerprints it (paths, sizes, mtimes; no file is opened) and
+re-indexes once a change has held still for one poll, so a file copied in, deleted or re-tagged elsewhere shows up
+by itself, and a copy in progress is left alone until it's whole. Only files with a changed mtime are re-tagged.
+Open pages poll `GET /api/jobs`, whose `gen` moves with every re-index, and then fetch the new list: no reload.
+`POST /api/rescan` still forces a re-index.
 
 ## YouTube
 

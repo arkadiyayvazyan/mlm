@@ -105,6 +105,25 @@ fn read_tags(path: &Path) -> Option<CachedTrack> {
     })
 }
 
+/// The audio files under `dir`, by extension; not macOS AppleDouble sidecars (._foo.aiff), which are 4 KB
+/// resource forks, not audio.
+fn audio_files(dir: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok).filter(|e| {
+        !e.file_name().to_string_lossy().starts_with("._")
+            && e.path().extension().and_then(|x| x.to_str()).is_some_and(|x| EXTS.contains(&x.to_ascii_lowercase().as_str()))
+    })
+}
+
+/// A number that changes when the library does: from every audio file's path, size and modification time.
+/// Cheap (no file is opened), so `main` polls it to notice files copied in, removed or re-tagged.
+pub fn fingerprint(dir: &Path) -> u64 {
+    audio_files(dir).fold(0, |sum, e| {
+        let mut h = DefaultHasher::new();
+        (e.path(), e.metadata().ok().map(|m| (m.len(), m.modified().ok()))).hash(&mut h);
+        sum.wrapping_add(h.finish()) // a sum: the order the directory lists them in doesn't matter
+    })
+}
+
 /// Walk `dir`, reuse cache entries with unchanged mtime, tag the rest, write cache, return tracks.
 pub fn scan(dir: &Path, cache_path: &Path) -> Vec<Track> {
     let old: Cache = std::fs::read(cache_path)
@@ -113,16 +132,8 @@ pub fn scan(dir: &Path, cache_path: &Path) -> Vec<Track> {
         .unwrap_or_default();
     let mut new = Cache::default();
     let mut n = 0usize;
-    for e in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+    for e in audio_files(dir) {
         let p = e.path();
-        // macOS AppleDouble sidecars (._foo.aiff) are 4 KB resource forks, not audio
-        if e.file_name().to_string_lossy().starts_with("._") {
-            continue;
-        }
-        match p.extension().and_then(|x| x.to_str()) {
-            Some(x) if EXTS.contains(&x.to_ascii_lowercase().as_str()) => {}
-            _ => continue,
-        }
         let mt = mtime(p);
         let t = match old.0.get(p) {
             Some((m, t)) if *m == mt && t.rate != 0 && t.bpm.is_some() => t.clone(), // rate==0 / bpm None: older cache entry, re-tag
@@ -204,6 +215,21 @@ mod tests {
         assert_eq!(scan(&dir, &cache)[0].bpm, 128); // second scan served from refreshed cache
         let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         assert!((now - 60..=now).contains(&added(&wav)), "added = just now: {}", added(&wav));
+
+        // the fingerprint moves when an audio file arrives, grows or leaves; not for sidecars and other files
+        let one = fingerprint(&dir);
+        assert_eq!(fingerprint(&dir), one);
+        std::fs::write(dir.join("._t.wav"), "resource fork").unwrap();
+        std::fs::write(dir.join("notes.txt"), "not audio").unwrap();
+        assert_eq!(fingerprint(&dir), one);
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/new.MP3"), "half a copy").unwrap();
+        let two = fingerprint(&dir);
+        assert_ne!(two, one);
+        std::fs::write(dir.join("sub/new.MP3"), "the whole copy").unwrap();
+        assert_ne!(fingerprint(&dir), two);
+        std::fs::remove_file(dir.join("sub/new.MP3")).unwrap();
+        assert_eq!(fingerprint(&dir), one);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
