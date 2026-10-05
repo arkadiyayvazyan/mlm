@@ -374,7 +374,7 @@ impl App {
             let mut idx: Vec<usize> = (0..self.tracks.len())
                 .filter(|&i| {
                     let t = &self.tracks[i];
-                    q.is_empty() || format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase().contains(&q)
+                    q.is_empty() || crate::matches(&q, &format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase())
                 })
                 .collect();
             let tr = &self.tracks;
@@ -779,7 +779,7 @@ impl eframe::App for App {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "↑ / ↓ — move the highlight without playing", "enter — play the highlighted track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "paste a YouTube link into search — download it as an MP3 into ytdl/", "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
+                          "search: easy && disco — both, easy || disco — either", "paste a YouTube link into search — download it as an MP3 into ytdl/", "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");

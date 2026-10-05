@@ -88,5 +88,6 @@ player (download, then conversion to MP3; for an analysis, how much is decoded),
 
 Open the **tags** panel under the search box to create a tag with a one-key shortcut. Pressing that
 key (or clicking the tag button) toggles the tag on the playing track; typing a tag name in search
-filters by it. Tags are stored in `MLM_TAGS` keyed by path relative to `MLM_DIR`, so they survive
+filters by it. Search terms combine: `easy && disco` needs both, `easy || disco` either, and `&&` binds
+tighter (`easy && disco || house`). Tags are stored in `MLM_TAGS` keyed by path relative to `MLM_DIR`, so they survive
 rescans and moving the library root.
