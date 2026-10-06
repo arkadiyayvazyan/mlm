@@ -258,7 +258,7 @@ impl Player {
             if f < l.loaded {
                 let (n, fb) = ((l.loaded - f).min(free).min(CHUNK), l.bps * l.nch);
                 out.clear();
-                pcm::to_stereo(&l.bytes[f * fb..(f + n) * fb], l.bps, l.nch, &mut out);
+                pcm::to_stereo(&l.bytes[(f - l.base) * fb..(f - l.base + n) * fb], l.bps, l.nch, &mut out);
                 ring.write(&out);
                 self.fill.1 += n;
                 free -= n;
