@@ -73,7 +73,7 @@ fn tempo(mut env: Vec<f32>, fps: f64) -> Option<f64> {
 pub fn detect(path: &Path, mut on_secs: impl FnMut(u64)) -> io::Result<Option<f64>> {
     let mut o: Option<(Onsets, u32)> = None;
     let mut last = 0;
-    crate::decode::each_packet(path, |_, rate, ch, samples| {
+    crate::decode::each_packet(path, 0, |_, rate, ch, samples| {
         let (on, _) = o.get_or_insert_with(|| (Onsets::new(rate), rate));
         for f in samples.chunks_exact(ch) {
             on.push(f.iter().map(|&s| s as f32 / 2147483648.0).sum::<f32>() / ch as f32);

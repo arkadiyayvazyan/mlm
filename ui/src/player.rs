@@ -2,7 +2,8 @@
 //! rest decoded server-side) and is kept as integer PCM. `tick` converts the next frames to stereo f32 and pushes them into a lock-free
 //! SharedArrayBuffer ring that an AudioWorklet (worklet.js) drains on the audio thread. Tracks are
 //! written back to back, so transitions are sample-exact and main-thread jank can't cause dropouts.
-//! Seek/skip bumps the ring's flush seq and rewrites from the new spot.
+//! Seek/skip bumps the ring's flush seq and rewrites from the new spot; a seek past what's loaded
+//! refetches from there (`/pcm?from=`), so the skipped part is never downloaded.
 use std::cell::{Ref, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -20,7 +21,7 @@ use crate::Track;
 
 const CAP: usize = 1 << 18; // ring frames, ~6 s at 44.1 kHz: rides out background-tab timer throttling (1 tick/s)
 const CHUNK: usize = 8192; // frames converted per ring write
-// ponytail: PCM kept whole in memory (~10 MB/min at 16-bit/44.1k stereo); window of cur + 2. Range-fetch on seek if phones choke
+// ponytail: PCM kept whole in memory (~10 MB/min at 16-bit/44.1k stereo); window of cur + 2
 const PRELOAD: usize = 2; // tracks fetched ahead of the playing one
 
 #[derive(Default)]
@@ -28,9 +29,10 @@ pub struct Loaded {
     pub rate: u32, // Hz, 0 = header not in yet
     nch: usize,
     bps: usize, // bytes per sample
-    bytes: Vec<u8>, // interleaved LE integer PCM
+    bytes: Vec<u8>, // interleaved LE integer PCM, from frame `base`
+    base: usize, // the track frame bytes[0] holds: > 0 after a seek past what was loaded (what came before is dropped)
     pub frames: usize, // total, known from the header before data arrives
-    pub loaded: usize, // frames in `bytes`
+    pub loaded: usize, // frames held are base..loaded
     pub peaks: Vec<f32>, // BINS entries 0..1
     done: bool, // fetch ended (ok or not); frames == loaded from then on
 }
@@ -42,7 +44,7 @@ impl Loaded {
     /// The whole track as a WAV file once fully loaded (to share an AIFF, which Android's share sheet won't take).
     pub fn wav(&self) -> Option<Vec<u8>> {
         let len = self.loaded * self.nch * self.bps;
-        (self.done && self.rate > 0).then(|| [&pcm::wav_header(self.rate, self.nch, self.bps, self.loaded)[..], &self.bytes[..len]].concat())
+        (self.done && self.rate > 0 && self.base == 0).then(|| [&pcm::wav_header(self.rate, self.nch, self.bps, self.loaded)[..], &self.bytes[..len]].concat())
     }
     fn append(&mut self, chunk: &[u8]) {
         self.bytes.extend_from_slice(chunk);
@@ -59,8 +61,8 @@ impl Loaded {
     }
     fn grew(&mut self) {
         let from = self.loaded;
-        self.loaded = (self.bytes.len() / (self.bps * self.nch)).min(self.frames);
-        pcm::update_peaks(&mut self.peaks, &self.bytes, self.bps, self.nch, from, self.loaded, self.frames);
+        self.loaded = (self.base + self.bytes.len() / (self.bps * self.nch)).min(self.frames);
+        pcm::update_peaks(&mut self.peaks, &self.bytes, self.bps, self.nch, self.base, from, self.loaded, self.frames);
     }
 }
 
@@ -203,13 +205,15 @@ impl Player {
         a.click();
     }
 
-    /// Play queue[i] from `offset` seconds. Reuses any slot already loading for the new window (seek, next, prev).
+    /// Play queue[i] from `offset` seconds. Reuses any slot already loading for the new window (seek, next, prev),
+    /// unless the one for queue[i] doesn't hold the frame to start at: then it's refetched from there.
     fn start(&mut self, i: usize, offset: f64) {
         let Some(t) = self.queue.get(i) else { return };
         let Some(sab) = self.ring.as_ref().map(|r| r.sab.clone()) else { return };
         let mut old = std::mem::take(&mut self.slots);
         let known = old.iter().find(|s| s.id == t.id).map(|s| s.l.borrow().rate).filter(|r| *r > 0);
         let rate = known.unwrap_or(t.rate);
+        let from = (offset * known.unwrap_or(0) as f64).round() as usize; // 0 until the header is in: nothing to seek in yet
         // the ctx runs at the track's rate: the worklet copies samples 1:1, nothing resamples
         if let Some(c) = self.ctx.take_if(|c| rate > 0 && c.sample_rate() as u32 != rate) {
             let _ = c.close();
@@ -220,10 +224,12 @@ impl Player {
         }
         for q in i..(i + 1 + PRELOAD).min(self.queue.len()) {
             let tr = &self.queue[q];
+            let held = |s: &Slot| { let l = s.l.borrow(); q != i || (l.base <= from && from <= l.loaded) };
             let mut s = match old.iter().position(|s| s.id == tr.id) {
-                Some(k) => old.swap_remove(k),
-                None if q == i => open(tr),
-                None => continue, // preloads start once this track is in: see tick
+                Some(k) if held(&old[k]) => old.swap_remove(k),
+                Some(k) if q == i => open(tr, from, Some(&old[k].l.borrow())),
+                None if q == i => open(tr, 0, None),
+                _ => continue, // preloads start once this track is in: see tick
             };
             s.q = q;
             self.slots.push(s);
@@ -233,7 +239,6 @@ impl Player {
         }
         let ring = self.ring.as_ref().unwrap();
         ring.flush();
-        let from = (offset * self.slot(i).unwrap().l.borrow().rate as f64).round() as usize;
         self.segs = [Seg { q: i, at: ring.w, from }].into();
         self.fill = (i, from);
         self.tick();
@@ -293,7 +298,7 @@ impl Player {
         }
         for k in q..(q + 1 + PRELOAD).min(self.queue.len()) {
             if self.slot(k).is_none() {
-                let s = open(&self.queue[k]);
+                let s = open(&self.queue[k], 0, None);
                 self.slots.push(Slot { q: k, ..s });
             }
         }
@@ -326,11 +331,17 @@ fn new_ctx(rate: u32, sab: &SharedArrayBuffer) -> AudioContext {
     ctx
 }
 
-fn open(t: &Track) -> Slot {
+/// Fetch `t` from frame `from`; `prev` is the load being left for this one (a seek past what it holds): its
+/// format and waveform carry over, so position and bars stay put while the new stream's header is in flight.
+fn open(t: &Track, from: usize, prev: Option<&Loaded>) -> Slot {
     let abort = AbortController::new().unwrap();
-    let l = Rc::new(RefCell::new(Loaded { peaks: vec![0.0; BINS], ..Default::default() }));
+    let l = match prev {
+        Some(p) => Loaded { rate: p.rate, nch: p.nch, bps: p.bps, frames: p.frames, peaks: p.peaks.clone(), base: from, loaded: from, ..Default::default() },
+        None => Loaded { peaks: vec![0.0; BINS], ..Default::default() },
+    };
+    let l = Rc::new(RefCell::new(l));
     let (l2, signal) = (l.clone(), abort.signal());
-    let url = format!("/api/tracks/{}/pcm", t.id);
+    let url = format!("/api/tracks/{}/pcm{}", t.id, if from > 0 { format!("?from={from}") } else { String::new() });
     spawn_local(async move {
         let _ = stream_wav(&url, &signal, &l2).await;
         let mut l = l2.borrow_mut();
@@ -347,11 +358,15 @@ async fn fetch(url: &str, signal: &AbortSignal) -> Result<Response, JsValue> {
     if res.ok() { Ok(res) } else { Err(format!("fetch {url}: {}", res.status()).into()) }
 }
 
-/// The server's WAV: fixed 44-byte header, then PCM appended as it arrives.
+/// The server's WAV: fixed 44-byte header, then PCM appended as it arrives. It starts at frame `x-mlm-from`
+/// (0 when the header is missing: an offline copy, served whole whatever was asked for).
 async fn stream_wav(url: &str, signal: &AbortSignal, l: &RefCell<Loaded>) -> Result<(), JsValue> {
-    let body = fetch(url, signal).await?.body().ok_or("no body")?;
+    let res = fetch(url, signal).await?;
+    let base: usize = res.headers().get("x-mlm-from")?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let body = res.body().ok_or("no body")?;
     let reader: ReadableStreamDefaultReader = body.get_reader().dyn_into()?;
     let mut head = vec![];
+    let mut got_head = false;
     loop {
         let r = JsFuture::from(reader.read()).await?;
         if signal.aborted() {
@@ -363,7 +378,7 @@ async fn stream_wav(url: &str, signal: &AbortSignal, l: &RefCell<Loaded>) -> Res
         // already a Uint8Array: `Uint8Array::new` on it would copy the whole chunk, `to_vec` a second time
         let chunk: Uint8Array = Reflect::get(&r, &"value".into())?.unchecked_into();
         let mut l = l.borrow_mut();
-        if l.rate > 0 {
+        if got_head {
             l.append_js(&chunk);
             continue;
         }
@@ -378,8 +393,9 @@ async fn stream_wav(url: &str, signal: &AbortSignal, l: &RefCell<Loaded>) -> Res
             return Err("bad wav header".into());
         }
         let frames = u32_at(40) as usize / (bps * nch);
-        (l.nch, l.bps, l.rate, l.frames) = (nch, bps, u32_at(24), frames);
+        (l.nch, l.bps, l.rate, l.base, l.loaded, l.frames) = (nch, bps, u32_at(24), base, base, base + frames);
         l.bytes.reserve_exact(frames * bps * nch);
         l.append(&head[44..]);
+        got_head = true;
     }
 }

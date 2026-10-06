@@ -29,6 +29,11 @@ impl Info {
     pub fn frame(&self) -> usize {
         (self.bits as usize / 8) * self.channels as usize
     }
+    /// The same sound minus its first `n` frames: a virtual WAV of the rest.
+    pub fn from_frame(self, n: u64) -> Info {
+        let cut = (n * self.frame() as u64).min(self.data_len);
+        Info { data_off: self.data_off + cut, data_len: self.data_len - cut, ..self }
+    }
     pub fn wav_header(&self) -> [u8; 44] {
         let mut h = [0u8; 44];
         let bps = self.bits / 8;
@@ -221,5 +226,10 @@ mod tests {
         assert_eq!(collect(info, &path, 45, 47).await, vec![1, 4, 3]);
         // range spanning header/data boundary
         assert_eq!(collect(info, &path, 42, 45).await, vec![0, 0, 2, 1]);
+        // from the second frame: a one-frame WAV of it
+        let rest = info.from_frame(1);
+        assert_eq!((rest.data_len, rest.wav_len()), (4, 48));
+        assert_eq!(collect(rest, &path, 40, 47).await, vec![4, 0, 0, 0, 6, 5, 8, 7]);
+        assert_eq!(info.from_frame(9).data_len, 0);
     }
 }

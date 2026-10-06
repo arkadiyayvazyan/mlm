@@ -6,13 +6,14 @@ mod library;
 #[allow(dead_code)] // shared with the UI; the server only needs Tags + Op::apply
 mod tags;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -223,20 +224,25 @@ async fn index() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/html"), (COOP, "same-origin"), (COEP, "require-corp")], include_bytes!("../ui/index.html").as_slice())
 }
 
-/// Any format as a streamed WAV (the egui player's input): AIFF byte-swapped, the rest decoded.
-async fn pcm(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Response {
+/// Any format as a streamed WAV (the egui player's input): AIFF byte-swapped, the rest decoded. `?from=<frame>`
+/// starts mid-track (a seek past what the player holds); the header then counts the frames left, and
+/// `x-mlm-from` tells the player where the stream starts (absent from offline copies, which are whole).
+async fn pcm(State(app): State<App>, Path(id): Path<u64>, Query(q): Query<HashMap<String, u64>>, req: Request) -> Response {
     let tracks = app.tracks();
     let Some(t) = tracks.iter().find(|t| t.id == id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if t.is_aiff() {
-        return match stream_aiff(&t.path, req.headers()).await {
+    let from = q.get("from").copied().unwrap_or(0);
+    let res = if t.is_aiff() {
+        match stream_aiff(&t.path, req.headers(), from).await {
             Ok(r) => r,
-            Err(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()).into_response(),
-        };
-    }
-    let body = Body::from_stream(decode::stream(t.path.clone(), t.duration_ms));
-    ([(header::CONTENT_TYPE, "audio/wav")], body).into_response()
+            Err(e) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()).into_response(),
+        }
+    } else {
+        let body = Body::from_stream(decode::stream(t.path.clone(), t.duration_ms, from));
+        ([(header::CONTENT_TYPE, "audio/wav")], body).into_response()
+    };
+    ([("x-mlm-from", from)], res).into_response()
 }
 
 /// 10 s of silence the UI loops in an <audio> element while playing: Chrome on Android only shows the lock-screen
@@ -449,9 +455,9 @@ async fn file(State(app): State<App>, Path(id): Path<u64>, req: Request) -> Resp
     }
 }
 
-async fn stream_aiff(path: &std::path::Path, headers: &HeaderMap) -> std::io::Result<Response> {
+async fn stream_aiff(path: &std::path::Path, headers: &HeaderMap, from: u64) -> std::io::Result<Response> {
     let mut f = std::fs::File::open(path)?;
-    let info = aiff::parse(&mut f)?;
+    let info = aiff::parse(&mut f)?.from_frame(from);
     let total = info.wav_len();
     let (start, end, status) = match parse_range(headers, total) {
         Some((a, b)) => (a, b, StatusCode::PARTIAL_CONTENT),

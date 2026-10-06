@@ -19,14 +19,15 @@ pub fn to_stereo(bytes: &[u8], bps: usize, nch: usize, out: &mut Vec<f32>) {
     }
 }
 
-/// Fold frames [from, to) of `bytes` into `peaks` (bin = frame * BINS / frames, max |sample| over channels).
+/// Fold frames [from, to) of `bytes` (which holds the track from frame `base`) into `peaks` (bin = frame * BINS / frames,
+/// max |sample| over channels).
 /// Only ~256 evenly spaced frames per bin are looked at: a 7-min track is 18 M frames, and doing all of them on
 /// the main thread while three tracks stream in made scrolling stutter on phones. The drawn waveform is the same.
-pub fn update_peaks(peaks: &mut [f32], bytes: &[u8], bps: usize, nch: usize, from: usize, to: usize, frames: usize) {
+pub fn update_peaks(peaks: &mut [f32], bytes: &[u8], bps: usize, nch: usize, base: usize, from: usize, to: usize, frames: usize) {
     let stride = (frames / (peaks.len() * 256)).max(1);
     for f in (from.next_multiple_of(stride)..to).step_by(stride) {
         let bin = (f as u64 * peaks.len() as u64 / frames as u64) as usize; // u64: f * 1000 overflows wasm32's usize past 97 s
-        for s in bytes[f * bps * nch..(f + 1) * bps * nch].chunks_exact(bps) {
+        for s in bytes[(f - base) * bps * nch..(f - base + 1) * bps * nch].chunks_exact(bps) {
             peaks[bin] = peaks[bin].max(sample(s).abs());
         }
     }
@@ -69,10 +70,14 @@ fn stereo_16_bit_and_peaks() {
     to_stereo(&bytes[..11], 2, 2, &mut out); // trailing partial frame is left for the next call
     assert_eq!(out, [1000.0 / 32768.0, -2000.0 / 32768.0, 32767.0 / 32768.0, -1.0]);
     let mut peaks = vec![0.0; BINS];
-    update_peaks(&mut peaks, &bytes, 2, 2, 0, 3, 3);
+    update_peaks(&mut peaks, &bytes, 2, 2, 0, 0, 3, 3);
     // bins: frame f -> f*1000/3 = 0, 333, 666
     assert_eq!((peaks[0], peaks[333], peaks[666]), (2000.0 / 32768.0, 1.0, 0.5));
     assert_eq!(peaks.iter().filter(|p| **p != 0.0).count(), 3);
+    // the same bytes held from frame 1 of a 4-frame track: the first frame in them is track frame 1
+    let mut peaks = vec![0.0; BINS];
+    update_peaks(&mut peaks, &bytes, 2, 2, 1, 1, 4, 4);
+    assert_eq!((peaks[250], peaks[500], peaks[750]), (2000.0 / 32768.0, 1.0, 0.5));
 }
 
 #[test]
@@ -82,7 +87,7 @@ fn peaks_of_a_long_track_are_sampled_but_still_found() {
     bytes[2 * 999_999..][..2].copy_from_slice(&i16::MAX.to_le_bytes()); // one loud sample in the last bin, on the stride
     let mut peaks = vec![0.0; BINS];
     for (a, b) in [(0, 400_000), (400_000, frames)] { // arrives in two chunks, split off-stride
-        update_peaks(&mut peaks, &bytes, 2, 1, a, b, frames);
+        update_peaks(&mut peaks, &bytes, 2, 1, 0, a, b, frames);
     }
     assert_eq!(peaks[BINS - 1], i16::MAX as f32 / 32768.0);
     assert_eq!(peaks.iter().filter(|p| **p > 0.0).count(), 1);
