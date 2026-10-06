@@ -464,7 +464,7 @@ impl App {
                 // Pi out of reach: tracks without an offline copy can't play, show them faded
                 let fade = |c: Color32| if offline && !have.contains(&t.id) { c.gamma_multiply(0.35) } else { c };
                 let (text, weak) = (fade(text), fade(weak));
-                let icon = if busy.contains(&t.id) { "…" } else if have.contains(&t.id) { OFFLINE_ICON } else { "" };
+                let icon = if busy.contains_key(&t.id) { "…" } else if have.contains(&t.id) { OFFLINE_ICON } else { "" };
                 let clip = |c: Rect| ui.painter().with_clip_rect(c.intersect(ui.clip_rect()));
                 let font = FontId::proportional(14.0);
                 let dur = fmt(t.duration_ms as f64 / 1000.0);
@@ -750,10 +750,17 @@ impl eframe::App for App {
             }
         });
         egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
-        if !self.jobs.is_empty() {
-            // one bar per running (or just finished) download / analysis, above the player
+        let dl = self.off.busy.borrow();
+        if !self.jobs.is_empty() || !dl.is_empty() {
+            // one bar per running (or just finished) download / analysis, above the player; offline copies on their way in too
             egui::Panel::bottom("jobs").show(ui, |ui| {
                 ui.add_space(4.0);
+                let mut dls: Vec<_> = dl.iter().collect();
+                dls.sort_by_key(|(_, d)| &d.name); // a map: without this the bars shuffle every frame
+                for (id, d) in dls {
+                    let p = ui.ctx().animate_value_with_time(egui::Id::new(("dl", *id)), if d.total > 0.0 { (d.got / d.total) as f32 } else { 0.0 }, 0.5);
+                    ui.add(egui::ProgressBar::new(p).text(format!("{} — {:.0} of {:.0} MB", d.name, d.got / 1e6, d.total / 1e6)));
+                }
                 for j in self.jobs.iter().filter(|j| j.state != "queued") {
                     if j.state == "failed" {
                         ui.colored_label(ui.visuals().error_fg_color, format!("{} — failed: {}", j.name, j.text));
@@ -770,6 +777,7 @@ impl eframe::App for App {
                 ui.add_space(4.0);
             });
         }
+        drop(dl);
         egui::CentralPanel::default().show(ui, |ui| self.list(ui));
         if let Some((dt, cpu)) = &mut self.fps {
             // smoothed over ~20 frames; repaint continuously so the number is the real frame rate

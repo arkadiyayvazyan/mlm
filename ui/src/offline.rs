@@ -2,22 +2,29 @@
 //! "tracks" Cache Storage, which `sw.js` serves when asked; the rest of the app is cached by `sw.js` itself.
 //! Tag edits are `Op`s queued in localStorage and sent whenever the Pi answers.
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use eframe::egui;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{Cache, RequestInit, Response};
+use web_sys::{Cache, ReadableStreamDefaultReader, RequestInit, Response, ResponseInit};
 
 use crate::tags::{Op, Tags};
 use crate::Track;
 
 const PENDING: &str = "mlm-pending"; // localStorage key of the unsent tag edits
 
+/// A track on its way into the cache: name, bytes in, bytes expected (0 until the stream's header says).
+pub struct Download {
+    pub name: String,
+    pub got: f64,
+    pub total: f64,
+}
+
 pub struct Offline {
     pub have: Rc<RefCell<HashSet<u64>>>, // downloaded track ids
-    pub busy: Rc<RefCell<HashSet<u64>>>, // downloading
+    pub busy: Rc<RefCell<HashMap<u64, Download>>>, // downloading, with how far along (for the bars above the player)
     pub unreachable: Rc<Cell<bool>>,     // the last request to the Pi failed (or sw.js answered from its cache)
     pub pending: Vec<Op>,
     sending: Rc<Cell<bool>>,
@@ -27,6 +34,40 @@ pub struct Offline {
 
 async fn tracks_cache() -> Result<Cache, JsValue> {
     JsFuture::from(web_sys::window().unwrap().caches()?.open("tracks")).await?.dyn_into()
+}
+
+/// Fetch the track's /pcm into the cache, counting the bytes as they pass (what `cache.add` would do, but
+/// visible): the body is tee'd, one branch straight into the cache, the other read here. The total comes from
+/// Content-Length (AIFF) or, for a decoded stream that has none, the WAV header's data size.
+async fn store(c: &Cache, id: u64, busy: &RefCell<HashMap<u64, Download>>, ctx: &egui::Context) -> Result<(), JsValue> {
+    let res: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(&pcm(id))).await?.dyn_into()?;
+    if !res.ok() {
+        return Err(format!("fetch: {}", res.status()).into());
+    }
+    let mut total: f64 = res.headers().get("content-length")?.and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let branches = res.body().ok_or("no body")?.tee();
+    let init = ResponseInit::new();
+    init.set_headers(&res.headers());
+    let put = JsFuture::from(c.put_with_str(&pcm(id), &Response::new_with_opt_readable_stream_and_init(branches.get(0).dyn_ref(), &init)?));
+    let reader: ReadableStreamDefaultReader = branches.get(1).dyn_into::<web_sys::ReadableStream>()?.get_reader().dyn_into()?;
+    let mut got = 0.0;
+    loop {
+        let r = JsFuture::from(reader.read()).await?;
+        if js_sys::Reflect::get(&r, &"done".into())?.is_truthy() {
+            break;
+        }
+        let chunk: js_sys::Uint8Array = js_sys::Reflect::get(&r, &"value".into())?.unchecked_into();
+        if total == 0.0 && got == 0.0 && chunk.length() >= 44 {
+            total = 44.0 + chunk.subarray(40, 44).to_vec().iter().rev().fold(0u32, |n, b| n << 8 | *b as u32) as f64;
+        }
+        got += chunk.length() as f64;
+        if let Some(d) = busy.borrow_mut().get_mut(&id) {
+            (d.got, d.total) = (got, total);
+        }
+        ctx.request_repaint();
+    }
+    put.await?;
+    Ok(())
 }
 
 fn pcm(id: u64) -> String {
@@ -61,7 +102,7 @@ impl Offline {
     /// Download the track for offline use, or drop the offline copy (after asking).
     pub fn toggle(&self, t: &Track, note: Rc<RefCell<Option<String>>>) {
         let id = t.id;
-        if self.busy.borrow().contains(&id) {
+        if self.busy.borrow().contains_key(&id) {
             return;
         }
         let name = t.rel.rsplit('/').next().unwrap_or(&t.rel).to_owned();
@@ -70,7 +111,7 @@ impl Offline {
             return;
         }
         let (have, busy, ctx) = (self.have.clone(), self.busy.clone(), self.ctx.clone());
-        busy.borrow_mut().insert(id);
+        busy.borrow_mut().insert(id, Download { name: name.clone(), got: 0.0, total: 0.0 });
         spawn_local(async move {
             let r: Result<(), JsValue> = async {
                 let c = tracks_cache().await?;
@@ -79,7 +120,7 @@ impl Offline {
                     JsFuture::from(c.delete_with_str(&format!("/api/tracks/{id}/art"))).await?;
                     have.borrow_mut().remove(&id);
                 } else {
-                    JsFuture::from(c.add_with_str(&pcm(id))).await?; // fetch + store; sw.js serves it from now on
+                    store(&c, id, &busy, &ctx).await?; // fetch + store; sw.js serves it from now on
                     JsFuture::from(c.add_with_str(&format!("/api/tracks/{id}/art"))).await?; // lock-screen art offline
                     have.borrow_mut().insert(id);
                     // ask the browser not to evict downloads when the phone runs low on space
