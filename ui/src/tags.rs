@@ -22,6 +22,7 @@ pub enum Op {
     Tag { rel: String, name: String, on: bool },
     Define { name: String, key: String, hue: u16 }, // create a tag, or set its key / hue
     Remove { name: String },
+    Rename { from: String, to: String }, // keeps the key, hue and tracks
 }
 
 impl Tags {
@@ -35,6 +36,7 @@ impl Tags {
                 self.hues.insert(name.clone(), *hue);
             }
             Op::Remove { name } => self.remove(name),
+            Op::Rename { from, to } => self.rename(from, to),
         }
     }
 
@@ -60,11 +62,31 @@ impl Tags {
 
     /// New tag definition, or an error message the form can show.
     pub fn add(&mut self, name: &str, key: &str) -> Result<(), String> {
+        self.check(name, key, None)?;
+        self.keys.insert(name.trim().to_string(), key.to_string());
+        Ok(())
+    }
+
+    /// A tag's new name and key as the ops that get there (none when nothing changed), or an error message.
+    pub fn edit(&self, old: &str, name: &str, key: &str) -> Result<Vec<Op>, String> {
+        self.check(name, key, Some(old))?;
+        let (name, mut ops) = (name.trim(), vec![]);
+        if name != old {
+            ops.push(Op::Rename { from: old.into(), to: name.into() });
+        }
+        if self.keys.get(old).is_some_and(|k| k != key) {
+            ops.push(Op::Define { name: name.into(), key: key.into(), hue: self.hues.get(old).copied().unwrap_or(0) });
+        }
+        Ok(ops)
+    }
+
+    /// Name and key valid for a new tag, or for the existing tag `except` (which may keep its own).
+    fn check(&self, name: &str, key: &str, except: Option<&str>) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("name required".into());
         }
-        if self.keys.contains_key(name) {
+        if self.keys.contains_key(name) && except != Some(name) {
             return Err(format!("\"{name}\" exists"));
         }
         if key.chars().count() != 1 {
@@ -73,11 +95,25 @@ impl Tags {
         if RESERVED.contains(key) {
             return Err(format!("{} is a player key", if key == " " { "space" } else { key }));
         }
-        if let Some((used, _)) = self.keys.iter().find(|(_, k)| *k == key) {
+        if let Some((used, _)) = self.keys.iter().find(|(n, k)| *k == key && except != Some(n.as_str())) {
             return Err(format!("{key} is \"{used}\""));
         }
-        self.keys.insert(name.to_string(), key.to_string());
         Ok(())
+    }
+
+    /// Rename a tag everywhere; a no-op when `from` is gone or `to` already exists (edited elsewhere meanwhile).
+    pub fn rename(&mut self, from: &str, to: &str) {
+        if from == to || !self.keys.contains_key(from) || self.keys.contains_key(to) {
+            return;
+        }
+        let (key, hue) = (self.keys.remove(from).unwrap(), self.hues.remove(from));
+        self.keys.insert(to.to_string(), key);
+        if let Some(h) = hue {
+            self.hues.insert(to.to_string(), h);
+        }
+        for v in self.tracks.values_mut() {
+            v.iter_mut().filter(|n| *n == from).for_each(|n| *n = to.to_string());
+        }
     }
 
     /// Give each tag without a hue a random one, as far as possible from the hues already taken
@@ -148,6 +184,25 @@ fn ops_replay_and_merge() {
     assert!(b.tracks.is_empty() && b.keys.is_empty());
     let json = serde_json::to_string(&ops[1]).unwrap();
     assert_eq!(json, r#"{"op":"tag","rel":"x.aiff","name":"fav","on":true}"#);
+}
+
+#[test]
+fn edit_and_rename() {
+    let mut t = Tags::default();
+    t.add("fav", "f").unwrap();
+    t.add("chill", "c").unwrap();
+    t.toggle("a/1.aiff", "fav");
+    assert_eq!(t.edit("fav", "fav", "f").unwrap(), []); // unchanged: nothing to send
+    assert_eq!(t.edit("fav", "chill", "f").unwrap_err(), "\"chill\" exists");
+    assert_eq!(t.edit("fav", "fav", "c").unwrap_err(), "c is \"chill\"");
+    let ops = t.edit("fav", "best", "b").unwrap();
+    assert_eq!(ops.len(), 2);
+    ops.iter().for_each(|o| t.apply(o));
+    assert_eq!(t.keys.get("best").unwrap(), "b");
+    assert!(!t.keys.contains_key("fav"));
+    assert_eq!(t.of("a/1.aiff"), ["best"]);
+    t.apply(&Op::Rename { from: "best".into(), to: "chill".into() }); // taken meanwhile: ignored
+    assert!(t.keys.contains_key("best"));
 }
 
 #[test]

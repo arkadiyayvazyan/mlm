@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use eframe::egui::{
     self, pos2, text::LayoutJob, vec2, Align, Align2, Button, Color32, CornerRadius, FontId, Key, Label, Layout,
-    Modifiers, Painter, Rect, RichText, ScrollArea, Sense, TextEdit, TextFormat, Ui, Vec2,
+    DragValue, Modifiers, Painter, Rect, RichText, ScrollArea, Sense, TextEdit, TextFormat, Ui, Vec2,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -18,7 +18,6 @@ use crate::{fmt, Track};
 const ROW: f32 = 26.0;
 const NARROW: f32 = 600.0; // below this width (phones): two-line rows, touch-sized controls
 const ICON: f32 = 20.0; // the offline-copy column before the filename
-const OFFLINE_ICON: &str = "💾";
 
 pub struct App {
     tracks: Vec<Track>,
@@ -49,7 +48,19 @@ pub struct App {
     off: Offline,
     last_flush: f64, // egui time of the last retry of queued tag edits
     gen: u64,        // bumped whenever tracks or tags change: the filtered + sorted list is rebuilt only then
-    list_key: (String, Option<(usize, bool)>, u64, (bool, usize)), // (query, sort, gen, (offline, downloads)) the cached list was built for
+    bpm: (u32, u32), // BPM filter: center, ± range; kept while off so the closing row still shows them
+    bpm_on: bool,    // hold the bpm column to turn on
+    offline_only: bool, // tap the offline column: only tracks with a copy on this device
+    added: usize,   // index into ADDED_SPANS; kept while off so the closing row still shows it
+    added_on: bool, // hold the added column to turn on
+    tags_open: bool,
+    search_open: bool,
+    focus_search: bool, // the search field takes focus once it's drawn
+    new_tag_open: bool, // hold the tags button or press #; hold a tag to edit it
+    focus_new_tag: bool,
+    editing: Option<String>, // the tag the pane edits (its current name), None = new tag
+    // (query, sort, bpm, offline copies when filtering on them, added span, gen) the cached list was built for
+    list_key: (String, Option<(usize, bool)>, Option<(u32, u32)>, Option<usize>, Option<usize>, u64),
     list_idx: Vec<usize>, // that list, as indices into `tracks`
     fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
 }
@@ -95,6 +106,7 @@ fn load(inbox: &Rc<RefCell<Option<(Vec<Track>, Tags)>>>, ctx: &egui::Context, un
 
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
+        cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.12); // panes slide open fast (egui default 0.2 s)
         let inbox = Rc::new(RefCell::new(None));
         let off = Offline::new(&cc.egui_ctx);
         load(&inbox, &cc.egui_ctx, &off.unreachable, false);
@@ -128,7 +140,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sel: None, step: 0, enter: false, center: false, sort: None,
             jobs: vec![], jobs_in: Rc::default(), poll: (-1.0, true), lib_gen: None, status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX, (false, 0)), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, bpm: (120, 4), bpm_on: false, offline_only: false, added: 4, added_on: false, tags_open: false, search_open: false, focus_search: false, new_tag_open: false, focus_new_tag: false, editing: None, list_key: (String::new(), None, None, None, None, u64::MAX), list_idx: vec![], fps: None,
         }
     }
 
@@ -201,7 +213,7 @@ impl App {
             }
         }
         let name = filename(&t).to_owned();
-        if matches!(t.ext.as_str(), "mp3" | "m4a" | "wav" | "flac" | "ogg" | "oga" | "opus") {
+        if shares_original(&t) {
             self.status = Some(("preparing…".into(), f64::INFINITY));
             let (shared, note) = (self.shared.clone(), self.note.clone());
             spawn_local(async move {
@@ -225,7 +237,8 @@ impl App {
             return;
         }
         let Some(wav) = self.player.borrow().cur().and_then(|l| l.wav()) else {
-            *self.note.borrow_mut() = Some("still loading, try again in a moment".into());
+            let pct = self.player.borrow().cur().map_or(0, |l| l.loaded * 100 / l.frames.max(1));
+            *self.note.borrow_mut() = Some(format!("still loading ({pct}%): share works once the whole track is in"));
             return;
         };
         let o = web_sys::FilePropertyBag::new();
@@ -236,7 +249,7 @@ impl App {
         share_now(f, t.title, self.note.clone());
     }
 
-    /// vim-style: space = play/pause, j/k = next/prev, h/l = -/+ 1 min, ? = help, tag keys toggle tags;
+    /// vim-style: space = play/pause, j/k = next/prev, h/l = -/+ 1 min, ? = help, / = search, # = new tag, tag keys toggle tags;
     /// up/down = move the cursor without playing, enter = play the cursor row (both applied in `list`);
     /// ctrl+d = download, ctrl+a = analyze BPM (the browser's bookmark / select-all are cancelled in main.rs).
     fn keys(&mut self, ctx: &egui::Context) {
@@ -273,6 +286,12 @@ impl App {
                 "h" => p.skip(-60.0),
                 "l" => p.skip(60.0),
                 "?" => self.help = !self.help,
+                "/" => (self.search_open, self.focus_search) = (true, true),
+                "#" => {
+                    drop(p);
+                    (self.new_tag_open, self.focus_new_tag) = (true, true);
+                    self.new_tag();
+                }
                 _ => {
                     drop(p);
                     let name = self.tags.keys.iter().find(|(_, v)| **v == k).map(|(n, _)| n.clone());
@@ -287,32 +306,74 @@ impl App {
 
     fn tags_panel(&mut self, ui: &mut Ui) {
         let now = self.now_rel();
-        ui.horizontal_wrapped(|ui| {
-            for (n, k) in self.tags.keys.clone() {
+        let narrow = ui.available_width() < NARROW;
+        let h = if narrow { 36.0 } else { 0.0 }; // thumb-sized tags on phones
+        // right-aligned, in thumb reach, wrapping from the right (newest tags first)
+        // sized to its rows: in the full available rect a wrapping layout takes the panel's whole height
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 0.0), Layout::right_to_left(Align::Min).with_main_wrap(true), |ui| {
+            for (n, k) in self.tags.keys.clone().into_iter().rev() {
                 let on = now.as_ref().is_some_and(|r| self.tags.has(r, &n));
                 // always full pastel; a bright outline marks tags on the playing track
                 let stroke = if on { egui::Stroke::new(2.0, ui.visuals().strong_text_color()) } else { egui::Stroke::NONE };
-                let b = ui.add(Button::new(RichText::new(format!("{n}  {k}")).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke));
-                if let (true, Some(rel)) = (b.on_hover_text(format!("press {k} to toggle on the playing track")).clicked(), now.clone()) {
+                let b = ui.add(Button::new(RichText::new(if narrow { n.clone() } else { format!("{n}  {k}") }).color(INK)).fill(tag_color(&self.tags, &n)).stroke(stroke).min_size(vec2(0.0, h)));
+                let b = b.on_hover_text(format!("press {k} to toggle on the playing track; hold (right-click) to edit"));
+                if let (true, Some(rel)) = (b.clicked(), now.clone()) {
                     self.edit(Op::Tag { on: !on, rel, name: n.clone() });
                 }
-                let confirm = |m: &str| web_sys::window().unwrap().confirm_with_message(m).unwrap_or(false);
-                if ui.button("🗙").on_hover_text("delete tag").clicked() && confirm(&format!("Delete \"{n}\" from all tracks?")) {
-                    self.edit(Op::Remove { name: n.clone() });
+                if b.secondary_clicked() {
+                    (self.new_name, self.new_key, self.editing) = (n.clone(), k.clone(), Some(n.clone()));
+                    (self.new_tag_open, self.focus_new_tag) = (true, true);
+                    self.err.clear();
                 }
             }
-            let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(100.0));
-            let b = ui.add(TextEdit::singleline(&mut self.new_key).hint_text("key").char_limit(1).desired_width(30.0));
+        });
+    }
+
+    /// The pane makes a new tag (leaving a tag it was editing).
+    fn new_tag(&mut self) {
+        if self.editing.take().is_some() {
+            self.new_name.clear();
+            self.new_key.clear();
+        }
+    }
+
+    /// New tag: name, key, ➕ (or Enter); or, holding a tag, its name and key with ✔ save and 🗑 delete.
+    /// Closes once done.
+    fn new_tag_panel(&mut self, ui: &mut Ui) {
+        let narrow = ui.available_width() < NARROW;
+        let h = if narrow { 40.0 } else { 0.0 };
+        ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let b = |s: String| Button::new(RichText::new(s).size(15.0)).min_size(vec2(h, h));
+            let add = match self.editing.clone() {
+                None => ui.add(b(label(narrow, "➕", "➕ add"))).clicked(),
+                Some(old) => {
+                    let confirm = |m: &str| web_sys::window().unwrap().confirm_with_message(m).unwrap_or(false);
+                    if ui.add(b("🗑".into())).on_hover_text("delete tag").clicked() && confirm(&format!("Delete \"{old}\" from all tracks?")) {
+                        self.edit(Op::Remove { name: old });
+                        (self.new_tag_open, self.editing) = (false, None);
+                    }
+                    ui.add(b(label(narrow, "✔", "✔ save"))).clicked()
+                }
+            };
+            let b = ui.add(TextEdit::singleline(&mut self.new_key).hint_text("key").char_limit(1).desired_width(40.0).min_size(vec2(0.0, h)).vertical_align(Align::Center));
+            let a = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("new tag").desired_width(140.0).min_size(vec2(0.0, h)).vertical_align(Align::Center));
+            if std::mem::take(&mut self.focus_new_tag) {
+                a.request_focus();
+            }
             if a.changed() || b.changed() {
                 self.err.clear();
             }
             let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter));
-            if ui.button("add").clicked() || enter {
-                match self.tags.add(&self.new_name, &self.new_key) {
+            if add || enter {
+                let done = match self.editing.clone() {
+                    None => self.tags.add(&self.new_name, &self.new_key).map(|()| self.color_new_tags()), // queues the Define (key + hue)
+                    Some(old) => self.tags.edit(&old, &self.new_name, &self.new_key).map(|ops| ops.into_iter().for_each(|op| self.edit(op))),
+                };
+                match done {
                     Ok(()) => {
-                        self.color_new_tags(); // queues the new tag's Define (key + hue)
                         self.new_name.clear();
                         self.new_key.clear();
+                        (self.new_tag_open, self.editing) = (false, None);
                     }
                     Err(e) => self.err = e,
                 }
@@ -320,7 +381,7 @@ impl App {
             if !self.err.is_empty() {
                 ui.colored_label(ui.visuals().error_fg_color, &self.err);
             }
-        });
+        }));
     }
 
     fn player_bar(&mut self, ui: &mut Ui) {
@@ -337,17 +398,22 @@ impl App {
                 self.fps = if self.fps.is_some() { None } else { Some((0.0, 0.0)) };
             }
             let (mut share, mut bpm) = (false, false);
-            ui.horizontal(|ui| {
+            // all right-aligned, transport at the edge under the thumb: 📤 💓 ⬇ ⏮ ⏵ ⏭
+            ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 controls(ui, &mut p, 22.0, vec2(56.0, 40.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(40.0, 40.0));
-                    share = self.can_share && ui.add(b("share")).clicked();
-                    bpm = ui.add(b("bpm")).clicked();
-                    if ui.add(b("⬇")).clicked() {
-                        p.download();
-                    }
-                });
-            });
+                let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(40.0, 40.0));
+                let arrow = |s: &str| Button::new(RichText::new(s).size(22.0)).min_size(vec2(40.0, 40.0));
+                if ui.add(arrow("⬇")).clicked() {
+                    p.download();
+                }
+                let a = ui.add(b(""));
+                bars(ui, &a); // detect BPM: the logo's waveform, three bars
+                bpm = a.clicked();
+                // dimmed until an AIFF is fully in (its WAV is built from the PCM); a tap then says how far along it is
+                let ready = p.track().is_some_and(shares_original) || p.cur().is_some_and(|l| l.frames > 0 && l.loaded >= l.frames);
+                let dim = ui.visuals().weak_text_color();
+                share = self.can_share && ui.add(if ready { arrow("⬆") } else { Button::new(RichText::new("⬆").size(22.0).color(dim)).min_size(vec2(40.0, 40.0)) }).clicked();
+            }));
             drop(p);
             if bpm {
                 self.analyze(&ui.ctx().clone());
@@ -369,19 +435,29 @@ impl App {
     }
 
     fn list(&mut self, ui: &mut Ui) {
-        // filter + sort only when the query, sort or data changed: every frame costs too much on a phone
-        // Pi out of reach: only the downloaded tracks (the ones that can play)
-        let (offline, have) = (self.off.unreachable.get(), self.off.have.borrow());
-        let key = (self.q.clone(), self.sort, self.gen, (offline, have.len()));
+        let narrow = ui.available_width() < NARROW;
+        if !narrow {
+            self.header(ui, false); // phones: in the bottom panel, under the thumb
+        }
+        // filter + sort only when the query, sort, BPM filter or data changed: every frame costs too much on a phone
+        // ponytail: offline copies keyed by count, a swap of one copy for another in one frame goes unseen
+        // ponytail: the added span is judged against "now" when the list is rebuilt, not every frame
+        let only_have = self.offline_only || self.off.unreachable.get(); // Pi out of reach: only the tracks that can play
+        let key = (self.q.clone(), self.sort, self.bpm_on.then_some(self.bpm), only_have.then(|| self.off.have.borrow().len()), self.added_on.then_some(self.added), self.gen);
         if key != self.list_key {
             let q = self.q.trim().to_lowercase();
+            let have = self.off.have.borrow();
+            let since = (js_sys::Date::now() / 1000.0) as u64 - ADDED_SPANS[self.added].0 * 86_400;
             let mut idx: Vec<usize> = (0..self.tracks.len())
                 .filter(|&i| {
                     let t = &self.tracks[i];
-                    (!offline || have.contains(&t.id))
+                    self.bpm_on.then_some(self.bpm).is_none_or(|(c, r)| t.bpm > 0 && t.bpm.abs_diff(c) <= r)
+                        && (!only_have || have.contains(&t.id))
+                        && (!self.added_on || t.added >= since)
                         && (q.is_empty() || crate::matches(&q, &format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase()))
                 })
                 .collect();
+            drop(have);
             let tr = &self.tracks;
             if let Some((c, desc)) = self.sort {
                 match c {
@@ -397,26 +473,9 @@ impl App {
             }
             (self.list_idx, self.list_key) = (idx, key);
         }
-        drop(have);
         let list: Vec<&Track> = self.list_idx.iter().map(|&i| &self.tracks[i]).collect();
         let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color()); // one step brighter than egui defaults: easier to read
-        let narrow = ui.available_width() < NARROW;
-        let (row_h, hdr_h) = if narrow { (52.0, 36.0) } else { (ROW, ROW) };
-        // header: click a column to sort by it, again to reverse; on phones just four equal buttons
-        let (hdr, _) = ui.allocate_exact_size(vec2(ui.available_width(), hdr_h), Sense::hover());
-        let slots = if narrow { [0.0, 1.0, 2.0, 3.0, 4.0].map(|k| (16.0 + k * (hdr.width() - 32.0) / 5.0, (hdr.width() - 32.0) / 5.0)) } else { cols(hdr.width()) };
-        for (i, (x, cw)) in slots.into_iter().enumerate() {
-            let c = Rect::from_min_size(pos2(hdr.left() + x, hdr.top()), vec2(cw, hdr_h));
-            let r = ui.interact(c, ui.id().with(("sort", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-            let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
-            let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
-            let (at, align) = if i < 2 || narrow { (c.left_center(), Align2::LEFT_CENTER) } else { (c.right_center(), Align2::RIGHT_CENTER) };
-            let color = if r.hovered() || arrow != "" { text } else { weak };
-            ui.painter().with_clip_rect(c).text(at, align, label, FontId::proportional(13.0), color);
-            if r.clicked() {
-                self.sort = match self.sort { Some((j, d)) if j == i => Some((i, !d)), _ => Some((i, false)) };
-            }
-        }
+        let row_h = if narrow { 52.0 } else { ROW };
         let now_id = self.player.borrow().track().map(|t| t.id);
         // the cursor rides along with the playing track (j/k, auto-advance) unless the arrows moved it elsewhere
         if now_id != self.shown_id {
@@ -468,7 +527,11 @@ impl App {
                 // Pi out of reach: tracks without an offline copy can't play, show them faded
                 let fade = |c: Color32| if offline && !have.contains(&t.id) { c.gamma_multiply(0.35) } else { c };
                 let (text, weak) = (fade(text), fade(weak));
-                let icon = if busy.contains_key(&t.id) { "…" } else if have.contains(&t.id) { OFFLINE_ICON } else { "" };
+                let icon = |p: &Painter, at: egui::Pos2| if busy.contains_key(&t.id) {
+                    p.text(at, Align2::CENTER_CENTER, "…", FontId::proportional(13.0), text);
+                } else if have.contains(&t.id) {
+                    tray(p, at, text);
+                };
                 let clip = |c: Rect| ui.painter().with_clip_rect(c.intersect(ui.clip_rect()));
                 let font = FontId::proportional(14.0);
                 let dur = fmt(t.duration_ms as f64 / 1000.0);
@@ -477,7 +540,7 @@ impl App {
                     // filename on top; tags left, "duration · bpm" right underneath
                     let pad = row.shrink2(vec2(16.0, 6.0));
                     let (l1, l2) = pad.split_top_bottom_at_fraction(0.5);
-                    clip(l1).text(l1.left_center() + vec2(ICON / 2.0 - 2.0, 0.0), Align2::CENTER_CENTER, icon, FontId::proportional(13.0), text);
+                    icon(&clip(l1), l1.left_center() + vec2(ICON / 2.0 - 2.0, 0.0));
                     let (l1, l2) = (l1.with_min_x(l1.left() + ICON), l2.with_min_x(l2.left() + ICON));
                     clip(l1).text(l1.left_center(), Align2::LEFT_CENTER, filename(t), font, text);
                     let meta = if t.bpm > 0 { format!("{dur} · {} · {}", t.bpm, ymd(t.added)) } else { format!("{dur} · {}", ymd(t.added)) };
@@ -490,7 +553,7 @@ impl App {
                     let c = Rect::from_min_size(pos2(row.left() + x, row.top()), vec2(cw, row_h));
                     (c, clip(c))
                 };
-                clip(row).text(pos2(row.left() + 16.0 + ICON / 2.0 - 2.0, row.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(13.0), text);
+                icon(&clip(row), pos2(row.left() + 16.0 + ICON / 2.0 - 2.0, row.center().y));
                 let (c, p) = cell(0);
                 p.text(c.left_center(), Align2::LEFT_CENTER, filename(t), font.clone(), text);
                 let (c, p) = cell(1);
@@ -526,6 +589,95 @@ impl App {
             }
         }
     }
+
+    /// Filter row for the BPM filter: center and ± range, − / + for thumbs, drag or tap the number for big jumps.
+    fn bpm_panel(&mut self, ui: &mut Ui) {
+        let (c, r) = &mut self.bpm;
+        let mut off = false;
+        let narrow = ui.available_width() < NARROW;
+        let h = if narrow { 40.0 } else { 0.0 };
+        // right-aligned, in thumb reach; right-to-left adds the widgets in reverse: reads 🗙 − 124 + ± − 4 +
+        ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if narrow {
+                ui.spacing_mut().interact_size.y = h;
+                ui.spacing_mut().item_spacing.x = 4.0; // fits a 360 pt phone
+            }
+            let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(h, h));
+            if ui.add(b("+")).clicked() { *r = (*r + 1).min(50) }
+            ui.add(DragValue::new(r).range(0..=50));
+            if ui.add(b("−")).clicked() { *r = r.saturating_sub(1) }
+            ui.label("±");
+            if ui.add(b("+")).clicked() { *c = (*c + 1).min(300) }
+            ui.add(DragValue::new(c).range(1..=300));
+            if ui.add(b("−")).clicked() { *c = c.saturating_sub(1).max(1) }
+            off = ui.add(b(&label(narrow, "🗙", "🗙 bpm"))).on_hover_text("BPM filter off").clicked();
+        }));
+        if off {
+            self.bpm_on = false;
+        }
+    }
+
+    /// Filter row for the added filter: 🗙, − span +.
+    fn added_panel(&mut self, ui: &mut Ui) {
+        let narrow = ui.available_width() < NARROW;
+        let h = if narrow { 40.0 } else { 0.0 };
+        let mut off = false;
+        ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let b = |s: &str| Button::new(RichText::new(s).size(15.0)).min_size(vec2(h, h));
+            if ui.add(b("+")).clicked() { self.added = (self.added + 1).min(ADDED_SPANS.len() - 1) }
+            ui.label(format!("added in the last {}", ADDED_SPANS[self.added].1));
+            if ui.add(b("−")).clicked() { self.added = self.added.saturating_sub(1) }
+            off = ui.add(b(&label(narrow, "🗙", "🗙 added"))).on_hover_text("added filter off").clicked();
+        }));
+        if off {
+            self.added_on = false;
+        }
+    }
+
+    /// Column header: click a column to sort by it, again to reverse; hold (right-click) bpm to filter by BPM.
+    fn header(&mut self, ui: &mut Ui, narrow: bool) {
+        let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color());
+        // desktop: painted over the list's columns; phones: flat buttons, as wide as their text, 40 pt tall
+        let hdr = (!narrow).then(|| ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::hover()).0);
+        let r = match hdr {
+            None => ui.add(Button::new("").frame(false).min_size(vec2(28.0, 40.0))),
+            Some(hdr) => ui.interact(Rect::from_min_size(pos2(hdr.left() + 14.0, hdr.top()), vec2(ICON, ROW)), ui.id().with("offline_only"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand),
+        };
+        tray(ui.painter(), r.rect.center(), if self.offline_only || r.hovered() { text } else { weak });
+        if r.on_hover_text("only tracks on this device").clicked() {
+            self.offline_only = !self.offline_only;
+        }
+        for i in 0..5 {
+            let arrow = match self.sort { Some((j, d)) if j == i => if d { " ⬇" } else { " ⬆" }, _ => "" };
+            let label = format!("{}{arrow}", ["filename", "tags", "duration", "bpm", "added"][i]);
+            let lit = arrow != "" || (i == 3 && self.bpm_on) || (i == 4 && self.added_on);
+            let r = match hdr {
+                None => ui.add(Button::new(RichText::new(label).size(13.0).color(if lit { text } else { weak })).frame(false).min_size(vec2(0.0, 40.0))),
+                Some(hdr) => {
+                    let (x, cw) = cols(hdr.width())[i];
+                    let c = Rect::from_min_size(pos2(hdr.left() + x, hdr.top()), vec2(cw, ROW));
+                    let r = ui.interact(c, ui.id().with(("sort", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let (at, align) = if i < 2 { (c.left_center(), Align2::LEFT_CENTER) } else { (c.right_center(), Align2::RIGHT_CENTER) };
+                    ui.painter().with_clip_rect(c).text(at, align, label, FontId::proportional(13.0), if lit || r.hovered() { text } else { weak });
+                    r
+                }
+            };
+            if r.clicked() {
+                self.sort = match self.sort { Some((j, d)) if j == i => Some((i, !d)), _ => Some((i, false)) };
+            }
+            if i == 4 && r.secondary_clicked() {
+                self.added_on = !self.added_on;
+            }
+            if i == 3 && r.secondary_clicked() && !self.bpm_on {
+                let now = self.player.borrow().track().map_or(0, |t| t.bpm); // start around the playing track
+                if now > 0 {
+                    self.bpm.0 = now;
+                }
+                self.bpm_on = true;
+            }
+        }
+    }
 }
 
 /// Column (x, width) in a row `w` wide, after the ICON column: filename 2fr, tags 1fr, duration 4em, bpm 3em,
@@ -534,6 +686,14 @@ fn cols(w: f32) -> [(f32, f32); 5] {
     let fr = ((w - 32.0 - ICON - 32.0 - 56.0 - 42.0 - 64.0) / 3.0).max(0.0);
     let x = 16.0 + ICON;
     [(x, 2.0 * fr), (x + 8.0 + 2.0 * fr, fr), (x + 16.0 + 3.0 * fr, 56.0), (x + 80.0 + 3.0 * fr, 42.0), (x + 130.0 + 3.0 * fr, 64.0)]
+}
+
+/// Spans for the added filter: days and label.
+const ADDED_SPANS: [(u64, &str); 8] = [(1, "day"), (3, "3 days"), (7, "week"), (14, "2 weeks"), (30, "month"), (90, "3 months"), (180, "6 months"), (365, "year")];
+
+/// Button text: just the icon on phones, `text` otherwise.
+fn label(narrow: bool, icon: &str, text: &str) -> String {
+    (if narrow { icon } else { text }).to_owned()
 }
 
 /// Unix seconds as local yy/mm/dd.
@@ -564,11 +724,37 @@ fn chips(p: &Painter, all: &Tags, tags: &[String], mut x: f32, y: f32) {
     }
 }
 
+/// Offline copy: a down arrow into a tray, 12 pt, centered on `at`.
+fn tray(p: &Painter, at: egui::Pos2, c: Color32) {
+    let s = egui::Stroke::new(1.5, c);
+    let v = |x: f32, y: f32| at + vec2(x, y);
+    p.line_segment([v(0.0, -6.0), v(0.0, 2.0)], s);
+    p.line(vec![v(-3.5, -1.5), v(0.0, 2.0), v(3.5, -1.5)], s);
+    p.line(vec![v(-6.0, 1.0), v(-6.0, 6.0), v(6.0, 6.0), v(6.0, 1.0)], s);
+}
+
+/// Three waveform bars (short, tall, medium), like the app icon, centered on a button.
+fn bars(ui: &Ui, r: &egui::Response) {
+    let c = ui.style().interact(r).fg_stroke.color;
+    for (k, h) in [8.0, 16.0, 11.0].into_iter().enumerate() {
+        let x = r.rect.center().x + (k as f32 - 1.0) * 5.5;
+        ui.painter().rect_filled(Rect::from_center_size(pos2(x, r.rect.center().y), vec2(3.0, h)), 1.5, c);
+    }
+}
+
 fn controls(ui: &mut Ui, p: &mut Player, size: f32, min: Vec2) {
     let b = |s: &str| Button::new(RichText::new(s).size(size)).min_size(min);
-    if ui.add(b("⏮")).clicked() { p.prev() }
-    if ui.add(b(if p.playing() { "⏸" } else { "▶" })).clicked() { p.toggle() }
-    if ui.add(b("⏭")).clicked() { p.next() }
+    let mut order = [0, 1, 2];
+    if ui.layout().prefer_right_to_left() {
+        order.reverse(); // still reads ⏮ ⏵ ⏭
+    }
+    for k in order {
+        match k {
+            0 => if ui.add(b("⏮")).clicked() { p.prev() },
+            1 => if ui.add(b(if p.playing() { "⏸" } else { "▶" })).clicked() { p.toggle() },
+            _ => if ui.add(b("⏭")).clicked() { p.next() },
+        }
+    }
 }
 
 /// Title — artist (with `time` right-aligned beside it, on phones), and the waveform seek bar under it.
@@ -640,6 +826,11 @@ fn share_now(f: web_sys::File, title: String, note: Rc<RefCell<Option<String>>>)
             }
         }
     });
+}
+
+/// Formats the share sheet takes as they are; anything else (AIFF) goes as a WAV built from the fully loaded PCM.
+fn shares_original(t: &Track) -> bool {
+    matches!(t.ext.as_str(), "mp3" | "m4a" | "wav" | "flac" | "ogg" | "oga" | "opus")
 }
 
 fn filename(t: &Track) -> &str {
@@ -719,45 +910,78 @@ impl eframe::App for App {
         if self.status.as_ref().is_some_and(|(_, until)| now > *until) {
             self.status = None;
         }
-        if let Some((msg, _)) = &self.status {
-            egui::Area::new("status".into()).anchor(Align2::CENTER_TOP, vec2(0.0, 8.0)).show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| ui.add(Label::new(msg.as_str()).wrap_mode(egui::TextWrapMode::Extend)));
-            });
-        }
         self.keys(&ui.ctx().clone());
-        egui::Panel::top("search").show(ui, |ui| {
-            ui.add_space(8.0);
-            let hint = format!("search {} tracks", self.tracks.len());
-            let h = if ui.available_width() < NARROW { 36.0 } else { 0.0 }; // thumb-sized on phones
-            let before = self.q.len();
-            let r = ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)));
-            // a YouTube link pasted here (or typed, then enter) is a download, not a search
-            let link = self.q.trim().starts_with("https://") && ["youtube.com/", "youtu.be/"].iter().any(|h| self.q.contains(h));
-            let pasted = r.changed() && (self.q.len() > before + 1 || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))));
-            if link && (pasted || r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
-                let url = std::mem::take(&mut self.q).trim().to_owned();
-                self.start_job("/api/ytdl".into(), Some(url), ui.ctx());
-            }
-            ui.collapsing("tags", |ui| self.tags_panel(ui));
+        egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
+        // search, tags, filters and (on phones) sorting sit just above the player: all in thumb reach
+        egui::Panel::bottom("search").show(ui, |ui| {
+            ui.add_space(4.0);
             if self.off.unreachable.get() {
                 let n = self.off.pending.len();
                 let queued = if n > 0 { format!(" · {n} tag change{} waiting to sync", if n == 1 { "" } else { "s" }) } else { String::new() };
                 ui.weak(format!("offline: playing downloaded tracks{queued}"));
             }
+            let narrow = ui.available_width() < NARROW;
             let offer = self.install.borrow().clone();
             if let Some(e) = offer {
-                if ui.button("install app").clicked() {
+                let b = ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.button(label(narrow, "📲", "install app")).clicked()).inner).inner;
+                if b {
                     if let Ok(f) = js_sys::Reflect::get(&e, &"prompt".into()).and_then(|f| f.dyn_into::<js_sys::Function>()) {
                         let _ = f.call0(&e); // inside the click: egui runs click logic in the pointer event
                     }
                     *self.install.borrow_mut() = None;
                 }
             }
+            let h = if narrow { 40.0 } else { 0.0 }; // thumb-sized on phones
+            // on phones the sort buttons, then the search and tags toggles at the right edge
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0; // still fits a 360 pt phone
+                if narrow {
+                    self.header(ui, true);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let b = |s: String, on: bool| Button::new(RichText::new(s).size(15.0)).selected(on).min_size(vec2(h, h));
+                    let t = ui.add(b(label(narrow, "🏷", "🏷 tags"), self.tags_open)).on_hover_text("hold (right-click) or #: new tag");
+                    if t.clicked() {
+                        self.tags_open = !self.tags_open;
+                    }
+                    if t.secondary_clicked() {
+                        self.new_tag_open = !self.new_tag_open || self.editing.is_some();
+                        self.focus_new_tag = self.new_tag_open;
+                        self.new_tag();
+                    }
+                    // lit while a query filters the list, even with the field hidden
+                    if ui.add(b(label(narrow, "🔍", "🔍 search"), self.search_open || !self.q.is_empty())).clicked() {
+                        self.search_open = !self.search_open;
+                        self.focus_search = self.search_open;
+                    }
+                });
+            });
+            ui.add_space(4.0);
         });
-        egui::Panel::bottom("player").show(ui, |ui| self.player_bar(ui));
+        // panes slide out of the controls; `&mut { … }`: a copy, only our own buttons open and close them
+        egui::Panel::bottom("bpm_pane").resizable(false).show_collapsible(ui, &mut { self.bpm_on }, |ui| {
+            ui.add_space(4.0);
+            self.bpm_panel(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("added_pane").resizable(false).show_collapsible(ui, &mut { self.added_on }, |ui| {
+            ui.add_space(4.0);
+            self.added_panel(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("tags_pane").resizable(false).show_collapsible(ui, &mut { self.tags_open }, |ui| {
+            ui.add_space(4.0);
+            self.tags_panel(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("new_tag_pane").resizable(false).show_collapsible(ui, &mut { self.new_tag_open }, |ui| {
+            ui.add_space(4.0);
+            self.new_tag_panel(ui);
+            ui.add_space(4.0);
+        });
         let dl = self.off.busy.borrow();
         if !self.jobs.is_empty() || !dl.is_empty() {
-            // one bar per running (or just finished) download / analysis, above the player; offline copies on their way in too
+            // one bar per running (or just finished) download / analysis, above the controls; offline copies on their way in too
             egui::Panel::bottom("jobs").show(ui, |ui| {
                 ui.add_space(4.0);
                 let mut dls: Vec<_> = dl.iter().collect();
@@ -783,7 +1007,39 @@ impl eframe::App for App {
             });
         }
         drop(dl);
-        egui::CentralPanel::default().show(ui, |ui| self.list(ui));
+        // search at the top: at the bottom the phone keyboard would cover it
+        egui::Panel::top("search_field").resizable(false).show_collapsible(ui, &mut { self.search_open }, |ui| {
+            let h = if ui.available_width() < NARROW { 40.0 } else { 0.0 };
+            ui.add_space(4.0);
+            ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(Button::new(RichText::new("🗙").size(15.0)).min_size(vec2(h, h))).on_hover_text("clear and close").clicked() {
+                    self.q.clear();
+                    self.search_open = false;
+                }
+                let hint = format!("search {} tracks", self.tracks.len());
+                let before = self.q.len();
+                let r = ui.add(TextEdit::singleline(&mut self.q).hint_text(hint).desired_width(f32::INFINITY).min_size(vec2(0.0, h)).vertical_align(Align::Center));
+                if std::mem::take(&mut self.focus_search) {
+                    r.request_focus();
+                }
+                // a YouTube link pasted here (or typed, then enter) is a download, not a search
+                let link = self.q.trim().starts_with("https://") && ["youtube.com/", "youtu.be/"].iter().any(|h| self.q.contains(h));
+                let pasted = r.changed() && (self.q.len() > before + 1 || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))));
+                if link && (pasted || r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
+                    let url = std::mem::take(&mut self.q).trim().to_owned();
+                    self.start_job("/api/ytdl".into(), Some(url), ui.ctx());
+                }
+            }));
+            ui.add_space(4.0);
+        });
+        let list = egui::CentralPanel::default().show(ui, |ui| self.list(ui));
+        if let Some((msg, _)) = &self.status {
+            // just above the bottom controls and panes, where the eyes are after a tap
+            let at = pos2(ui.ctx().content_rect().center().x, list.response.rect.bottom() - 8.0);
+            egui::Area::new("status".into()).pivot(Align2::CENTER_BOTTOM).fixed_pos(at).show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.add(Label::new(msg.as_str()).wrap_mode(egui::TextWrapMode::Extend)));
+            });
+        }
         if let Some((dt, cpu)) = &mut self.fps {
             // smoothed over ~20 frames; repaint continuously so the number is the real frame rate
             *dt += (ui.input(|i| i.unstable_dt) as f64 * 1000.0 - *dt) * 0.05;
@@ -799,7 +1055,8 @@ impl eframe::App for App {
                 ui.label(RichText::new("Keys").strong());
                 for l in ["space — play / pause", "j / k — next / previous track", "↑ / ↓ — move the highlight without playing", "enter — play the highlighted track", "h / l — back / forward 1 min",
                           "ctrl+d — download the playing track", "ctrl+a — detect the playing track's BPM and write it into the file", "tag keys — toggle that tag on the playing track (see tags panel)",
-                          "search: easy && disco — both, easy || disco — either", "paste a YouTube link into search — download it as an MP3 into ytdl/", "? — this help", "tap the time (0:42 / 5:10) — frame-rate readout"] {
+                          "search: easy && disco — both, easy || disco — either", "paste a YouTube link into search — download it as an MP3 into ytdl/",
+                          "? — this help", "/ — search", "# — new tag", "hold (right-click) the bpm / added column — filter by BPM ± range / added in the last …", "tap the time (0:42 / 5:10) — frame-rate readout"] {
                     ui.label(l);
                 }
                 ui.small("Esc closes");
