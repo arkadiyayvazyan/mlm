@@ -49,7 +49,7 @@ pub struct App {
     off: Offline,
     last_flush: f64, // egui time of the last retry of queued tag edits
     gen: u64,        // bumped whenever tracks or tags change: the filtered + sorted list is rebuilt only then
-    list_key: (String, Option<(usize, bool)>, u64), // (query, sort, gen) the cached list was built for
+    list_key: (String, Option<(usize, bool)>, u64, (bool, usize)), // (query, sort, gen, (offline, downloads)) the cached list was built for
     list_idx: Vec<usize>, // that list, as indices into `tracks`
     fps: Option<(f64, f64)>, // frame-time readout (tap the time): smoothed frame interval and ui() time, ms
 }
@@ -128,7 +128,7 @@ impl App {
             tracks: vec![], tags: Tags::default(), inbox, player, q: String::new(), new_name: String::new(),
             new_key: String::new(), err: String::new(), help: false, shown_id: None, view: (0.0, 0.0), sel: None, step: 0, enter: false, center: false, sort: None,
             jobs: vec![], jobs_in: Rc::default(), poll: (-1.0, true), lib_gen: None, status: None, note: Rc::default(), can_share: can_share(), shared: Rc::default(), install,
-            off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX), list_idx: vec![], fps: None,
+            off, last_flush: 0.0, gen: 0, list_key: (String::new(), None, u64::MAX, (false, 0)), list_idx: vec![], fps: None,
         }
     }
 
@@ -370,13 +370,16 @@ impl App {
 
     fn list(&mut self, ui: &mut Ui) {
         // filter + sort only when the query, sort or data changed: every frame costs too much on a phone
-        let key = (self.q.clone(), self.sort, self.gen);
+        // Pi out of reach: only the downloaded tracks (the ones that can play)
+        let (offline, have) = (self.off.unreachable.get(), self.off.have.borrow());
+        let key = (self.q.clone(), self.sort, self.gen, (offline, have.len()));
         if key != self.list_key {
             let q = self.q.trim().to_lowercase();
             let mut idx: Vec<usize> = (0..self.tracks.len())
                 .filter(|&i| {
                     let t = &self.tracks[i];
-                    q.is_empty() || crate::matches(&q, &format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase())
+                    (!offline || have.contains(&t.id))
+                        && (q.is_empty() || crate::matches(&q, &format!("{} {} {} {} {}", t.rel, t.title, t.artist, t.album, self.tags.of(&t.rel).join(" ")).to_lowercase()))
                 })
                 .collect();
             let tr = &self.tracks;
@@ -394,6 +397,7 @@ impl App {
             }
             (self.list_idx, self.list_key) = (idx, key);
         }
+        drop(have);
         let list: Vec<&Track> = self.list_idx.iter().map(|&i| &self.tracks[i]).collect();
         let (weak, text) = (ui.visuals().text_color(), ui.visuals().strong_text_color()); // one step brighter than egui defaults: easier to read
         let narrow = ui.available_width() < NARROW;
@@ -689,6 +693,7 @@ impl eframe::App for App {
         }
         if let Some(status) = self.jobs_in.borrow_mut().take() {
             self.poll.1 = status.is_some();
+            self.off.unreachable.set(!self.poll.1); // the Pi going away (or coming back) mid-session shows here first
             let Status { gen, jobs } = status.unwrap_or(Status { gen: self.lib_gen.unwrap_or(0), jobs: vec![] });
             // the library changed on the server (a finished download or analysis, files copied into the folder,
             // also while this tab slept): fetch the new list
